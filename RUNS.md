@@ -4,26 +4,22 @@ This file documents training runs for the structure prediction model.
 
 ---
 
-## Run 6: Multi-Model Support + ProstT5 Fix (2026-01-16) ✅ CURRENT
+## Run 7: ProstT5 Baseline Only (2026-01-16) ✅ CURRENT
 
 ### Wandb Link
 **(pending - check wandb for latest run)**
 
 ### Status
-Training with fixed ProstT5 comparison (added barrier to prevent NCCL timeout).
+Training with simplified ProstT5 evaluation (baseline only, no model generation).
 
 ### Command
 ```bash
-export WANDB_API_KEY="<your-key>"
-export WANDB_PROJECT="structure-prediction"
-
 accelerate launch \
     --config_file configs/accelerate_config.yaml \
-    --num_processes 8 \
     -m structure_search.train \
     --mode llama-8b-lora \
     --db-path data/foldseek/afdb50/afdb50 \
-    --output-dir outputs/structure_predictor_v17 \
+    --output-dir outputs/structure_predictor_v18 \
     --batch-size 24 \
     --gradient-accumulation-steps 1 \
     --max-length 1024 \
@@ -36,30 +32,39 @@ accelerate launch \
     --prostt5-eval-samples 50
 ```
 
-### New Features
+### Key Fix
+**Removed model generation from ProstT5 evaluation**: The previous crash was caused by calling `model.generate()` on only rank 0, which triggered NCCL collective operations that other ranks weren't participating in. Now we only evaluate ProstT5 baseline vs ground truth during training. Full model evaluation will be done separately.
+
+### Configuration
+Same as Run 6, with simplified ProstT5 evaluation.
+
+---
+
+## Run 6: Multi-Model Support + ProstT5 Fix (2026-01-16) - CRASHED
+
+### Wandb Link
+**(check wandb for run)**
+
+### Status
+Crashed at step 1000 during ProstT5 comparison - NCCL timeout due to model.generate() on single rank.
+
+| Step | Train Loss | Eval Loss |
+|------|------------|-----------|
+| 500 | 1.55 | ~1.52 |
+| 1000 | 1.53 | 1.52 |
+
+### Crash Details
+- NCCL timeout at step 1000 after eval completed
+- Root cause: `model.generate()` triggers NCCL collective ops even when only called on rank 0
+- Rank 0 had 320 more NCCL operations enqueued than other ranks
+- Fixed in Run 7 by removing model generation from ProstT5 eval
+
+### Features Added
 1. **Multi-model support**: New `--mode` argument with presets:
    - `llama-8b-lora`: LoRA fine-tuning on Llama 3.1 8B (default)
    - `tinyllama-full`: Full fine-tuning on TinyLlama 1.1B
 
-2. **Fixed ProstT5 NCCL timeout**: Added `accelerator.wait_for_everyone()` barrier so all GPUs wait while main process runs ProstT5 comparison
-
-### Configuration
-
-| Parameter | Value |
-|-----------|-------|
-| Mode | `llama-8b-lora` |
-| Base model | `meta-llama/Llama-3.1-8B` |
-| Dataset | afdb50 (66.7M proteins) |
-| LoRA rank | 64 |
-| LoRA alpha | 128 |
-| Batch size (per GPU) | 24 |
-| Effective batch size | 192 (24 × 8 GPUs) |
-| Learning rate | 2e-4 |
-| Max sequence length | 1024 tokens |
-| Precision | bfloat16 |
-| Gradient checkpointing | enabled |
-| ProstT5 eval interval | 1000 steps |
-| ProstT5 eval samples | 50 |
+2. **ProstT5 comparison** (barrier fix was insufficient)
 
 ---
 
