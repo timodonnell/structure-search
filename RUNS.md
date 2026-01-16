@@ -4,7 +4,56 @@ This file documents training runs for the structure prediction model.
 
 ---
 
-## Run 2: Fixed Tokenization (2026-01-16) ✅ CURRENT
+## Run 3: Optimized Batch Size (2026-01-16) ✅ CURRENT
+
+### Wandb Link
+**https://wandb.ai/timodonnell/structure-prediction/runs/m6oumnrn**
+
+### Command
+```bash
+export WANDB_API_KEY="<your-key>"
+export WANDB_PROJECT="structure-prediction"
+
+accelerate launch \
+    --config_file configs/accelerate_config.yaml \
+    --num_processes 8 \
+    -m structure_search.train \
+    --model-name meta-llama/Llama-3.1-8B \
+    --db-path data/foldseek/afdb50/afdb50 \
+    --output-dir outputs/structure_predictor_v7 \
+    --batch-size 48 \
+    --gradient-accumulation-steps 1 \
+    --max-length 1024 \
+    --learning-rate 2e-4 \
+    --num-epochs 1 \
+    --log-interval 10 \
+    --save-interval 500 \
+    --eval-interval 250
+```
+
+### Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Base model | `meta-llama/Llama-3.1-8B` |
+| Dataset | afdb50 (66.7M proteins) |
+| LoRA rank | 64 |
+| LoRA alpha | 128 |
+| Batch size (per GPU) | 48 |
+| Gradient accumulation | 1 |
+| Effective batch size | 384 (48 × 8 GPUs) |
+| Learning rate | 2e-4 |
+| Max sequence length | 1024 tokens |
+| Precision | bfloat16 |
+
+### Notes
+- Fixed wandb logging with `accelerator.init_trackers()` and `float()` conversion
+- Optimized batch size from 4 to 48 per GPU after OOM testing
+- No gradient accumulation needed with larger batch size
+
+---
+
+## Run 2: Fixed Tokenization (2026-01-16)
 
 ### Wandb Link
 **https://wandb.ai/timodonnell/structure-prediction/runs/5lv9i3dc**
