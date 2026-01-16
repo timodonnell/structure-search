@@ -87,6 +87,9 @@ def create_model_and_tokenizer(
     # Resize embeddings for new tokens
     model.resize_token_embeddings(len(tokenizer))
 
+    # Enable gradient checkpointing to reduce memory
+    model.gradient_checkpointing_enable()
+
     # Apply LoRA
     if use_lora:
         if use_4bit:
