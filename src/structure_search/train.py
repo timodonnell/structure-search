@@ -28,6 +28,7 @@ from transformers import (
 )
 
 from .dataset import AA_START, SEP_TOKEN, SS_START, StructurePredictionDataset
+from .foldseek_db import PairedFoldseekDB
 
 # Model configuration presets
 MODEL_CONFIGS = {
@@ -194,6 +195,131 @@ def create_dataloaders(
     return train_loader, val_loader
 
 
+def get_fixed_eval_samples(db_path: str, num_samples: int = 100, seed: int = 42, max_seq_len: int = 300):
+    """Get a fixed set of eval samples for consistent evaluation.
+
+    Args:
+        db_path: Path to Foldseek database
+        num_samples: Number of samples to return
+        seed: Random seed for reproducibility
+        max_seq_len: Maximum sequence length to include
+
+    Returns:
+        List of (aa_seq, ss_seq) tuples
+    """
+    import random
+    rng = random.Random(seed)
+
+    with PairedFoldseekDB(db_path) as db:
+        total = len(db)
+        # Use same seed as val split to get val indices
+        all_indices = list(range(total))
+        rng_split = random.Random(42)  # Same seed as dataset split
+        rng_split.shuffle(all_indices)
+        val_size = int(total * 0.001)  # Same as val_fraction
+        val_indices = all_indices[:val_size]
+
+        # Sample from val indices
+        rng.shuffle(val_indices)
+
+        samples = []
+        for idx in val_indices:
+            if len(samples) >= num_samples:
+                break
+            aa_seq, ss_seq = db.get_pair(idx)
+            # Filter by length
+            if len(aa_seq) <= max_seq_len and len(aa_seq) == len(ss_seq):
+                samples.append((aa_seq, ss_seq))
+
+        return samples
+
+
+def run_generation_eval(
+    model,
+    tokenizer,
+    eval_samples: list[tuple[str, str]],
+    device,
+    max_new_tokens: int = 512,
+) -> dict:
+    """Run generation-based evaluation on fixed samples.
+
+    Args:
+        model: The model to evaluate
+        tokenizer: Tokenizer
+        eval_samples: List of (aa_seq, ss_seq) tuples
+        device: Device to run on
+        max_new_tokens: Maximum tokens to generate
+
+    Returns:
+        Dictionary with metrics: token_accuracy, length_match_rate, valid_char_rate
+    """
+    from .evaluate import compute_token_accuracy, VALID_3DI_CHARS
+
+    model.eval()
+
+    correct_total = 0
+    tokens_total = 0
+    length_matches = 0
+    valid_chars = 0
+    predictions = []
+
+    for aa_seq, gt_3di in eval_samples:
+        # Format input: <AA> M K T L ... <SEP> <SS>
+        aa_spaced = " ".join(aa_seq)
+        prompt = f"{AA_START} {aa_spaced} {SEP_TOKEN} {SS_START}"
+
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=1024,
+        ).to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=len(aa_seq) + 10,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                use_cache=True,
+            )
+
+        # Decode and extract 3Di portion
+        decoded = tokenizer.decode(outputs[0], skip_special_tokens=False)
+
+        # Extract 3Di tokens after <SS>
+        if SS_START in decoded:
+            ss_part = decoded.split(SS_START)[1]
+            # Remove special tokens and spaces
+            ss_part = ss_part.replace(tokenizer.eos_token, "").strip()
+            pred_3di = "".join(ss_part.split())
+        else:
+            pred_3di = ""
+
+        predictions.append(pred_3di)
+
+        # Compute token accuracy
+        _, correct, total = compute_token_accuracy(pred_3di, gt_3di)
+        correct_total += correct
+        tokens_total += total
+
+        # Check length match
+        if len(pred_3di) == len(gt_3di):
+            length_matches += 1
+
+        # Check valid characters
+        if pred_3di and all(c in VALID_3DI_CHARS for c in pred_3di.lower()):
+            valid_chars += 1
+
+    n = len(eval_samples)
+    return {
+        "gen_token_accuracy": correct_total / tokens_total if tokens_total > 0 else 0.0,
+        "gen_length_match_rate": length_matches / n if n > 0 else 0.0,
+        "gen_valid_char_rate": valid_chars / n if n > 0 else 0.0,
+        "gen_num_samples": n,
+    }
+
+
 def train(
     mode: str = "llama-8b-lora",
     model_name: str | None = None,
@@ -212,8 +338,8 @@ def train(
     eval_interval: int = 500,
     max_steps: int = -1,
     resume_from: str | None = None,
-    prostt5_eval_interval: int = 0,
-    prostt5_eval_samples: int = 50,
+    gen_eval_interval: int = 500,
+    gen_eval_samples: int = 50,
 ):
     """Main training function."""
 
@@ -369,59 +495,52 @@ def train(
         logger.info(f"Step 0 | Initial Eval Loss: {avg_eval_loss:.4f} (completed in {eval_elapsed:.1f}s)")
     accelerator.log({"eval_loss": float(avg_eval_loss)}, step=0)
 
-    # Initial ProstT5 baseline evaluation
-    if prostt5_eval_interval > 0:
+    # Get fixed eval samples for generation-based evaluation
+    fixed_eval_samples = None
+    if gen_eval_interval > 0:
+        if accelerator.is_main_process:
+            logger.info(f"Loading {gen_eval_samples} fixed eval samples for generation-based evaluation...")
+            fixed_eval_samples = get_fixed_eval_samples(
+                db_path=db_path,
+                num_samples=gen_eval_samples,
+                seed=42,
+                max_seq_len=300,
+            )
+            logger.info(f"  Loaded {len(fixed_eval_samples)} eval samples")
+
+            # Save eval sample indices for reproducibility
+            eval_samples_path = Path(output_dir) / "eval_samples.txt"
+            with open(eval_samples_path, "w") as f:
+                for aa_seq, ss_seq in fixed_eval_samples:
+                    f.write(f"{aa_seq}\t{ss_seq}\n")
+            logger.info(f"  Saved eval samples to {eval_samples_path}")
+
+    # Initial generation-based evaluation (step 0)
+    if gen_eval_interval > 0 and fixed_eval_samples:
         if accelerator.is_main_process:
             try:
-                from .evaluate import ProstT5Baseline, compute_token_accuracy
-                from .foldseek_db import PairedFoldseekDB
+                logger.info(f"Running initial generation-based evaluation ({len(fixed_eval_samples)} samples)...")
+                gen_start = time.time()
 
-                logger.info(f"Running initial ProstT5 baseline evaluation ({prostt5_eval_samples} samples)...")
-
-                prostt5_start = time.time()
-                if not hasattr(train, "_prostt5"):
-                    logger.info("  Loading ProstT5 model...")
-                    train._prostt5 = ProstT5Baseline(device="cuda:0")
-                    logger.info(f"  ProstT5 model loaded in {time.time() - prostt5_start:.1f}s")
-
-                if not hasattr(train, "_eval_db"):
-                    train._eval_db = PairedFoldseekDB(db_path)
-
-                import random
-                eval_indices = random.sample(
-                    range(len(train._eval_db)),
-                    min(prostt5_eval_samples, len(train._eval_db))
+                # Run generation eval on main process only
+                unwrapped_model = accelerator.unwrap_model(model)
+                gen_metrics = run_generation_eval(
+                    model=unwrapped_model,
+                    tokenizer=tokenizer,
+                    eval_samples=fixed_eval_samples,
+                    device=accelerator.device,
                 )
 
-                prostt5_correct, prostt5_total = 0, 0
-                samples_processed = 0
-                inference_start = time.time()
-
-                for i, idx in enumerate(eval_indices):
-                    aa_seq, gt_3di = train._eval_db.get_pair(idx)
-                    if len(aa_seq) > 200 or len(aa_seq) != len(gt_3di):
-                        continue
-
-                    prostt5_pred = train._prostt5.predict([aa_seq])[0]
-                    _, correct, total = compute_token_accuracy(prostt5_pred, gt_3di)
-                    prostt5_correct += correct
-                    prostt5_total += total
-                    samples_processed += 1
-
-                    # Progress logging every 10 samples
-                    if (i + 1) % 10 == 0:
-                        elapsed = time.time() - inference_start
-                        eta = elapsed / (i + 1) * (len(eval_indices) - i - 1)
-                        current_acc = prostt5_correct / prostt5_total if prostt5_total > 0 else 0
-                        logger.info(f"  ProstT5 progress: {i + 1}/{len(eval_indices)} samples, acc={current_acc:.4f} ({elapsed:.1f}s elapsed, ~{eta:.1f}s remaining)")
-
-                prostt5_acc = prostt5_correct / prostt5_total if prostt5_total > 0 else 0
-                prostt5_elapsed = time.time() - prostt5_start
-
-                logger.info(f"Step 0 | ProstT5 Baseline Accuracy: {prostt5_acc:.4f} ({samples_processed} samples in {prostt5_elapsed:.1f}s)")
-                accelerator.log({"prostt5_baseline_accuracy": prostt5_acc}, step=0)
+                gen_elapsed = time.time() - gen_start
+                logger.info(
+                    f"Step 0 | Gen Eval: accuracy={gen_metrics['gen_token_accuracy']:.4f}, "
+                    f"length_match={gen_metrics['gen_length_match_rate']:.4f}, "
+                    f"valid_chars={gen_metrics['gen_valid_char_rate']:.4f} "
+                    f"({gen_elapsed:.1f}s)"
+                )
+                accelerator.log(gen_metrics, step=0)
             except Exception as e:
-                logger.warning(f"Initial ProstT5 evaluation failed: {e}")
+                logger.warning(f"Initial generation evaluation failed: {e}")
                 import traceback
                 traceback.print_exc()
 
@@ -508,6 +627,31 @@ def train(
                     if accelerator.is_main_process:
                         logger.info(f"Step {global_step} | Eval Loss: {avg_eval_loss:.4f}")
                     accelerator.log({"eval_loss": float(avg_eval_loss)}, step=global_step)
+
+                    # Generation-based evaluation (only at gen_eval_interval)
+                    if gen_eval_interval > 0 and global_step % gen_eval_interval == 0 and fixed_eval_samples:
+                        if accelerator.is_main_process:
+                            try:
+                                gen_start = time.time()
+                                unwrapped_model = accelerator.unwrap_model(model)
+                                gen_metrics = run_generation_eval(
+                                    model=unwrapped_model,
+                                    tokenizer=tokenizer,
+                                    eval_samples=fixed_eval_samples,
+                                    device=accelerator.device,
+                                )
+                                gen_elapsed = time.time() - gen_start
+                                logger.info(
+                                    f"Step {global_step} | Gen Eval: accuracy={gen_metrics['gen_token_accuracy']:.4f}, "
+                                    f"length_match={gen_metrics['gen_length_match_rate']:.4f}, "
+                                    f"valid_chars={gen_metrics['gen_valid_char_rate']:.4f} "
+                                    f"({gen_elapsed:.1f}s)"
+                                )
+                                accelerator.log(gen_metrics, step=global_step)
+                            except Exception as e:
+                                logger.warning(f"Generation evaluation failed at step {global_step}: {e}")
+
+                        accelerator.wait_for_everyone()
 
                     model.train()
 
@@ -598,16 +742,16 @@ def main():
     parser.add_argument("--max-steps", type=int, default=-1, help="Max training steps")
     parser.add_argument("--resume-from", type=str, help="Resume from checkpoint")
     parser.add_argument(
-        "--prostt5-eval-interval",
+        "--gen-eval-interval",
         type=int,
-        default=0,
-        help="Interval for ProstT5 comparison (0=disabled)",
+        default=500,
+        help="Interval for generation-based evaluation (0=disabled)",
     )
     parser.add_argument(
-        "--prostt5-eval-samples",
+        "--gen-eval-samples",
         type=int,
         default=50,
-        help="Number of samples for ProstT5 comparison",
+        help="Number of samples for generation-based evaluation",
     )
 
     args = parser.parse_args()
@@ -630,8 +774,8 @@ def main():
         eval_interval=args.eval_interval,
         max_steps=args.max_steps,
         resume_from=args.resume_from,
-        prostt5_eval_interval=args.prostt5_eval_interval,
-        prostt5_eval_samples=args.prostt5_eval_samples,
+        gen_eval_interval=args.gen_eval_interval,
+        gen_eval_samples=args.gen_eval_samples,
     )
 
 
