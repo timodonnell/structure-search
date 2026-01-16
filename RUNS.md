@@ -6,6 +6,9 @@ This file documents training runs for the structure prediction model.
 
 ## Run 4: Stable Training with Eval Fix (2026-01-16) ✅ CURRENT
 
+### Wandb Link
+**https://wandb.ai/timodonnell/structure-prediction/runs/kr4u1yod**
+
 ### Status
 Training successfully running with evaluations completing every 500 steps.
 
