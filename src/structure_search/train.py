@@ -240,9 +240,15 @@ def train(
 
     if accelerator.is_main_process:
         os.makedirs(output_dir, exist_ok=True)
+        # Log the full command
+        import sys
+        full_command = " ".join(sys.argv)
+        logger.info(f"Command: python -m {full_command}")
         logger.info(f"Output directory: {output_dir}")
         logger.info(f"Using {accelerator.num_processes} GPUs")
         logger.info(f"Mode: {mode} (use_lora={use_lora})")
+        logger.info(f"WANDB_API_KEY set: {bool(os.environ.get('WANDB_API_KEY'))}")
+        logger.info(f"WANDB_PROJECT: {os.environ.get('WANDB_PROJECT', 'not set')}")
 
     # Initialize Wandb tracking
     if os.environ.get("WANDB_API_KEY"):
@@ -319,6 +325,84 @@ def train(
     if resume_from:
         logger.info(f"Resuming from: {resume_from}")
         accelerator.load_state(resume_from)
+
+    # Initial validation before training starts (step 0)
+    if accelerator.is_main_process:
+        logger.info("Running initial validation before training...")
+
+    model.eval()
+    eval_loss = 0.0
+    eval_steps = 0
+    max_eval_steps = 50
+
+    with torch.no_grad():
+        eval_iter = iter(val_loader)
+        for _ in range(max_eval_steps):
+            try:
+                eval_batch = next(eval_iter)
+            except StopIteration:
+                eval_iter = iter(val_loader)
+                eval_batch = next(eval_iter)
+
+            outputs = model(
+                input_ids=eval_batch["input_ids"],
+                attention_mask=eval_batch["attention_mask"],
+                labels=eval_batch["labels"],
+            )
+            eval_loss += outputs.loss.detach().float()
+            eval_steps += 1
+
+    eval_loss_tensor = torch.tensor([eval_loss], device=accelerator.device)
+    gathered_losses = accelerator.gather(eval_loss_tensor)
+    avg_eval_loss = gathered_losses.mean() / eval_steps
+
+    if accelerator.is_main_process:
+        logger.info(f"Step 0 | Initial Eval Loss: {avg_eval_loss:.4f}")
+    accelerator.log({"eval_loss": float(avg_eval_loss)}, step=0)
+
+    # Initial ProstT5 baseline evaluation
+    if prostt5_eval_interval > 0:
+        if accelerator.is_main_process:
+            try:
+                from .evaluate import ProstT5Baseline, compute_token_accuracy
+                from .foldseek_db import PairedFoldseekDB
+
+                logger.info("Running initial ProstT5 baseline evaluation...")
+
+                if not hasattr(train, "_prostt5"):
+                    train._prostt5 = ProstT5Baseline(device="cuda:0")
+
+                if not hasattr(train, "_eval_db"):
+                    train._eval_db = PairedFoldseekDB(db_path)
+
+                import random
+                eval_indices = random.sample(
+                    range(len(train._eval_db)),
+                    min(prostt5_eval_samples, len(train._eval_db))
+                )
+
+                prostt5_correct, prostt5_total = 0, 0
+
+                for idx in eval_indices:
+                    aa_seq, gt_3di = train._eval_db.get_pair(idx)
+                    if len(aa_seq) > 200 or len(aa_seq) != len(gt_3di):
+                        continue
+
+                    prostt5_pred = train._prostt5.predict([aa_seq])[0]
+                    _, correct, total = compute_token_accuracy(prostt5_pred, gt_3di)
+                    prostt5_correct += correct
+                    prostt5_total += total
+
+                prostt5_acc = prostt5_correct / prostt5_total if prostt5_total > 0 else 0
+
+                logger.info(f"Step 0 | ProstT5 Baseline Accuracy: {prostt5_acc:.4f}")
+                accelerator.log({"prostt5_baseline_accuracy": prostt5_acc}, step=0)
+            except Exception as e:
+                logger.warning(f"Initial ProstT5 evaluation failed: {e}")
+                import traceback
+                traceback.print_exc()
+
+        accelerator.wait_for_everyone()
 
     # Training loop
     model.train()
@@ -401,68 +485,6 @@ def train(
                     if accelerator.is_main_process:
                         logger.info(f"Step {global_step} | Eval Loss: {avg_eval_loss:.4f}")
                     accelerator.log({"eval_loss": float(avg_eval_loss)}, step=global_step)
-
-                    # ProstT5 baseline comparison (only on main process, at specified intervals)
-                    # NOTE: We only evaluate ProstT5 baseline vs ground truth here.
-                    # Our model's .generate() triggers NCCL ops that cause timeout when
-                    # only run on main process. Full model evaluation done separately.
-                    if prostt5_eval_interval > 0 and global_step % prostt5_eval_interval == 0:
-                        # All processes must enter this block to avoid NCCL timeout
-                        # The barrier at the end ensures synchronization
-                        if accelerator.is_main_process:
-                            try:
-                                from .evaluate import (
-                                    ProstT5Baseline,
-                                    compute_token_accuracy,
-                                )
-                                from .foldseek_db import PairedFoldseekDB
-
-                                logger.info("Running ProstT5 baseline evaluation...")
-
-                                # Load ProstT5 if not already loaded (use CPU to avoid GPU conflicts)
-                                if not hasattr(train, "_prostt5"):
-                                    # Use cuda:0 directly to avoid distributed device issues
-                                    train._prostt5 = ProstT5Baseline(device="cuda:0")
-
-                                # Get eval samples from database
-                                if not hasattr(train, "_eval_db"):
-                                    train._eval_db = PairedFoldseekDB(db_path)
-
-                                import random
-                                eval_indices = random.sample(
-                                    range(len(train._eval_db)),
-                                    min(prostt5_eval_samples, len(train._eval_db))
-                                )
-
-                                prostt5_correct, prostt5_total = 0, 0
-
-                                for idx in eval_indices:
-                                    aa_seq, gt_3di = train._eval_db.get_pair(idx)
-                                    if len(aa_seq) > 200 or len(aa_seq) != len(gt_3di):
-                                        continue
-
-                                    # ProstT5 prediction
-                                    prostt5_pred = train._prostt5.predict([aa_seq])[0]
-                                    _, correct, total = compute_token_accuracy(prostt5_pred, gt_3di)
-                                    prostt5_correct += correct
-                                    prostt5_total += total
-
-                                prostt5_acc = prostt5_correct / prostt5_total if prostt5_total > 0 else 0
-
-                                logger.info(
-                                    f"Step {global_step} | ProstT5 Baseline Accuracy: {prostt5_acc:.4f}"
-                                )
-                                accelerator.log(
-                                    {"prostt5_baseline_accuracy": prostt5_acc},
-                                    step=global_step,
-                                )
-                            except Exception as e:
-                                logger.warning(f"ProstT5 baseline evaluation failed: {e}")
-                                import traceback
-                                traceback.print_exc()
-
-                        # All processes must wait for main to finish ProstT5 comparison
-                        accelerator.wait_for_everyone()
 
                     model.train()
 
