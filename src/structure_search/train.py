@@ -403,119 +403,120 @@ def train(
                     accelerator.log({"eval_loss": float(avg_eval_loss)}, step=global_step)
 
                     # ProstT5 comparison (only on main process, at specified intervals)
-                    if (
-                        prostt5_eval_interval > 0
-                        and global_step % prostt5_eval_interval == 0
-                        and accelerator.is_main_process
-                    ):
-                        try:
-                            from .evaluate import (
-                                ProstT5Baseline,
-                                compute_token_accuracy,
-                                compute_validity_metrics,
-                            )
-                            from .foldseek_db import PairedFoldseekDB
-
-                            logger.info("Running ProstT5 comparison...")
-
-                            # Load ProstT5 if not already loaded
-                            if not hasattr(train, "_prostt5"):
-                                train._prostt5 = ProstT5Baseline(device=accelerator.device)
-
-                            # Get eval samples from database
-                            if not hasattr(train, "_eval_db"):
-                                train._eval_db = PairedFoldseekDB(db_path)
-
-                            import random
-                            eval_indices = random.sample(
-                                range(len(train._eval_db)),
-                                min(prostt5_eval_samples, len(train._eval_db))
-                            )
-
-                            our_correct, our_total = 0, 0
-                            prostt5_correct, prostt5_total = 0, 0
-
-                            # Collect predictions for validity metrics
-                            our_predictions = []
-                            ground_truths = []
-
-                            unwrapped = accelerator.unwrap_model(model)
-
-                            for idx in eval_indices:
-                                aa_seq, gt_3di = train._eval_db.get_pair(idx)
-                                if len(aa_seq) > 200 or len(aa_seq) != len(gt_3di):
-                                    continue
-
-                                # ProstT5 prediction
-                                prostt5_pred = train._prostt5.predict([aa_seq])[0]
-                                acc, correct, total = compute_token_accuracy(prostt5_pred, gt_3di)
-                                prostt5_correct += correct
-                                prostt5_total += total
-
-                                # Our model prediction
-                                aa_spaced = " ".join(aa_seq)
-                                prompt = f"{AA_START} {aa_spaced} {SEP_TOKEN} {SS_START}"
-                                inputs = tokenizer(
-                                    prompt, return_tensors="pt", truncation=True, max_length=max_length
-                                ).to(accelerator.device)
-
-                                with torch.no_grad():
-                                    outputs = unwrapped.generate(
-                                        **inputs,
-                                        max_new_tokens=len(aa_seq) + 10,
-                                        do_sample=False,
-                                        pad_token_id=tokenizer.pad_token_id,
-                                    )
-                                decoded = tokenizer.decode(outputs[0], skip_special_tokens=False)
-                                if SS_START in decoded:
-                                    ss_part = decoded.split(SS_START)[1]
-                                    ss_part = ss_part.replace(tokenizer.eos_token, "").strip()
-                                    our_pred = "".join(ss_part.split())
-                                else:
-                                    our_pred = ""
-
-                                acc, correct, total = compute_token_accuracy(our_pred, gt_3di)
-                                our_correct += correct
-                                our_total += total
-
-                                # Collect for validity metrics
-                                our_predictions.append(our_pred)
-                                ground_truths.append(gt_3di)
-
-                            our_acc = our_correct / our_total if our_total > 0 else 0
-                            prostt5_acc = prostt5_correct / prostt5_total if prostt5_total > 0 else 0
-
-                            # Compute validity metrics
-                            validity = compute_validity_metrics(our_predictions, ground_truths)
-
-                            logger.info(
-                                f"Step {global_step} | Our Accuracy: {our_acc:.4f} | "
-                                f"ProstT5 Accuracy: {prostt5_acc:.4f}"
-                            )
-                            logger.info(
-                                f"Step {global_step} | Validity: "
-                                f"length_match={validity['length_match_rate']:.2%}, "
-                                f"valid_chars={validity['valid_chars_rate']:.2%}, "
-                                f"fully_valid={validity['fully_valid_rate']:.2%}"
-                            )
-                            if validity['invalid_char_examples']:
-                                logger.info(
-                                    f"Step {global_step} | Invalid char examples: "
-                                    f"{validity['invalid_char_examples'][:2]}"
+                    # All processes must enter this block to avoid NCCL timeout
+                    if prostt5_eval_interval > 0 and global_step % prostt5_eval_interval == 0:
+                        if accelerator.is_main_process:
+                            try:
+                                from .evaluate import (
+                                    ProstT5Baseline,
+                                    compute_token_accuracy,
+                                    compute_validity_metrics,
                                 )
-                            accelerator.log(
-                                {
-                                    "our_3di_accuracy": our_acc,
-                                    "prostt5_3di_accuracy": prostt5_acc,
-                                    "validity_length_match": validity['length_match_rate'],
-                                    "validity_valid_chars": validity['valid_chars_rate'],
-                                    "validity_fully_valid": validity['fully_valid_rate'],
-                                    "validity_mean_length_diff": validity['mean_length_diff'],
-                                },
-                                step=global_step,
-                            )
-                        except Exception as e:
-                            logger.warning(f"ProstT5 comparison failed: {e}")
+                                from .foldseek_db import PairedFoldseekDB
+
+                                logger.info("Running ProstT5 comparison...")
+
+                                # Load ProstT5 if not already loaded
+                                if not hasattr(train, "_prostt5"):
+                                    train._prostt5 = ProstT5Baseline(device=accelerator.device)
+
+                                # Get eval samples from database
+                                if not hasattr(train, "_eval_db"):
+                                    train._eval_db = PairedFoldseekDB(db_path)
+
+                                import random
+                                eval_indices = random.sample(
+                                    range(len(train._eval_db)),
+                                    min(prostt5_eval_samples, len(train._eval_db))
+                                )
+
+                                our_correct, our_total = 0, 0
+                                prostt5_correct, prostt5_total = 0, 0
+
+                                # Collect predictions for validity metrics
+                                our_predictions = []
+                                ground_truths = []
+
+                                unwrapped = accelerator.unwrap_model(model)
+
+                                for idx in eval_indices:
+                                    aa_seq, gt_3di = train._eval_db.get_pair(idx)
+                                    if len(aa_seq) > 200 or len(aa_seq) != len(gt_3di):
+                                        continue
+
+                                    # ProstT5 prediction
+                                    prostt5_pred = train._prostt5.predict([aa_seq])[0]
+                                    acc, correct, total = compute_token_accuracy(prostt5_pred, gt_3di)
+                                    prostt5_correct += correct
+                                    prostt5_total += total
+
+                                    # Our model prediction
+                                    aa_spaced = " ".join(aa_seq)
+                                    prompt = f"{AA_START} {aa_spaced} {SEP_TOKEN} {SS_START}"
+                                    inputs = tokenizer(
+                                        prompt, return_tensors="pt", truncation=True, max_length=max_length
+                                    ).to(accelerator.device)
+
+                                    with torch.no_grad():
+                                        outputs = unwrapped.generate(
+                                            **inputs,
+                                            max_new_tokens=len(aa_seq) + 10,
+                                            do_sample=False,
+                                            pad_token_id=tokenizer.pad_token_id,
+                                        )
+                                    decoded = tokenizer.decode(outputs[0], skip_special_tokens=False)
+                                    if SS_START in decoded:
+                                        ss_part = decoded.split(SS_START)[1]
+                                        ss_part = ss_part.replace(tokenizer.eos_token, "").strip()
+                                        our_pred = "".join(ss_part.split())
+                                    else:
+                                        our_pred = ""
+
+                                    acc, correct, total = compute_token_accuracy(our_pred, gt_3di)
+                                    our_correct += correct
+                                    our_total += total
+
+                                    # Collect for validity metrics
+                                    our_predictions.append(our_pred)
+                                    ground_truths.append(gt_3di)
+
+                                our_acc = our_correct / our_total if our_total > 0 else 0
+                                prostt5_acc = prostt5_correct / prostt5_total if prostt5_total > 0 else 0
+
+                                # Compute validity metrics
+                                validity = compute_validity_metrics(our_predictions, ground_truths)
+
+                                logger.info(
+                                    f"Step {global_step} | Our Accuracy: {our_acc:.4f} | "
+                                    f"ProstT5 Accuracy: {prostt5_acc:.4f}"
+                                )
+                                logger.info(
+                                    f"Step {global_step} | Validity: "
+                                    f"length_match={validity['length_match_rate']:.2%}, "
+                                    f"valid_chars={validity['valid_chars_rate']:.2%}, "
+                                    f"fully_valid={validity['fully_valid_rate']:.2%}"
+                                )
+                                if validity['invalid_char_examples']:
+                                    logger.info(
+                                        f"Step {global_step} | Invalid char examples: "
+                                        f"{validity['invalid_char_examples'][:2]}"
+                                    )
+                                accelerator.log(
+                                    {
+                                        "our_3di_accuracy": our_acc,
+                                        "prostt5_3di_accuracy": prostt5_acc,
+                                        "validity_length_match": validity['length_match_rate'],
+                                        "validity_valid_chars": validity['valid_chars_rate'],
+                                        "validity_fully_valid": validity['fully_valid_rate'],
+                                        "validity_mean_length_diff": validity['mean_length_diff'],
+                                    },
+                                    step=global_step,
+                                )
+                            except Exception as e:
+                                logger.warning(f"ProstT5 comparison failed: {e}")
+
+                        # All processes must wait for main to finish ProstT5 comparison
+                        accelerator.wait_for_everyone()
 
                     model.train()
 
