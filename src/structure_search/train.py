@@ -177,6 +177,8 @@ def train(
     eval_interval: int = 500,
     max_steps: int = -1,
     resume_from: str | None = None,
+    prostt5_eval_interval: int = 0,
+    prostt5_eval_samples: int = 50,
 ):
     """Main training function."""
 
@@ -340,6 +342,92 @@ def train(
                     if accelerator.is_main_process:
                         logger.info(f"Step {global_step} | Eval Loss: {avg_eval_loss:.4f}")
                     accelerator.log({"eval_loss": float(avg_eval_loss)}, step=global_step)
+
+                    # ProstT5 comparison (only on main process, at specified intervals)
+                    if (
+                        prostt5_eval_interval > 0
+                        and global_step % prostt5_eval_interval == 0
+                        and accelerator.is_main_process
+                    ):
+                        try:
+                            from .evaluate import ProstT5Baseline, compute_token_accuracy
+                            from .foldseek_db import PairedFoldseekDB
+
+                            logger.info("Running ProstT5 comparison...")
+
+                            # Load ProstT5 if not already loaded
+                            if not hasattr(train, "_prostt5"):
+                                train._prostt5 = ProstT5Baseline(device=accelerator.device)
+
+                            # Get eval samples from database
+                            if not hasattr(train, "_eval_db"):
+                                train._eval_db = PairedFoldseekDB(db_path)
+
+                            import random
+                            eval_indices = random.sample(
+                                range(len(train._eval_db)),
+                                min(prostt5_eval_samples, len(train._eval_db))
+                            )
+
+                            our_correct, our_total = 0, 0
+                            prostt5_correct, prostt5_total = 0, 0
+
+                            unwrapped = accelerator.unwrap_model(model)
+
+                            for idx in eval_indices:
+                                aa_seq, gt_3di = train._eval_db.get_pair(idx)
+                                if len(aa_seq) > 200 or len(aa_seq) != len(gt_3di):
+                                    continue
+
+                                # ProstT5 prediction
+                                prostt5_pred = train._prostt5.predict([aa_seq])[0]
+                                acc, correct, total = compute_token_accuracy(prostt5_pred, gt_3di)
+                                prostt5_correct += correct
+                                prostt5_total += total
+
+                                # Our model prediction
+                                aa_spaced = " ".join(aa_seq)
+                                prompt = f"{AA_START} {aa_spaced} {SEP_TOKEN} {SS_START}"
+                                inputs = tokenizer(
+                                    prompt, return_tensors="pt", truncation=True, max_length=max_length
+                                ).to(accelerator.device)
+
+                                with torch.no_grad():
+                                    outputs = unwrapped.generate(
+                                        **inputs,
+                                        max_new_tokens=len(aa_seq) + 10,
+                                        do_sample=False,
+                                        pad_token_id=tokenizer.pad_token_id,
+                                    )
+                                decoded = tokenizer.decode(outputs[0], skip_special_tokens=False)
+                                if SS_START in decoded:
+                                    ss_part = decoded.split(SS_START)[1]
+                                    ss_part = ss_part.replace(tokenizer.eos_token, "").strip()
+                                    our_pred = "".join(ss_part.split())
+                                else:
+                                    our_pred = ""
+
+                                acc, correct, total = compute_token_accuracy(our_pred, gt_3di)
+                                our_correct += correct
+                                our_total += total
+
+                            our_acc = our_correct / our_total if our_total > 0 else 0
+                            prostt5_acc = prostt5_correct / prostt5_total if prostt5_total > 0 else 0
+
+                            logger.info(
+                                f"Step {global_step} | Our Accuracy: {our_acc:.4f} | "
+                                f"ProstT5 Accuracy: {prostt5_acc:.4f}"
+                            )
+                            accelerator.log(
+                                {
+                                    "our_3di_accuracy": our_acc,
+                                    "prostt5_3di_accuracy": prostt5_acc,
+                                },
+                                step=global_step,
+                            )
+                        except Exception as e:
+                            logger.warning(f"ProstT5 comparison failed: {e}")
+
                     model.train()
 
                 # Save checkpoint (must be called on all processes)
@@ -412,6 +500,18 @@ def main():
     parser.add_argument("--eval-interval", type=int, default=500, help="Eval interval")
     parser.add_argument("--max-steps", type=int, default=-1, help="Max training steps")
     parser.add_argument("--resume-from", type=str, help="Resume from checkpoint")
+    parser.add_argument(
+        "--prostt5-eval-interval",
+        type=int,
+        default=0,
+        help="Interval for ProstT5 comparison (0=disabled)",
+    )
+    parser.add_argument(
+        "--prostt5-eval-samples",
+        type=int,
+        default=50,
+        help="Number of samples for ProstT5 comparison",
+    )
 
     args = parser.parse_args()
 
@@ -433,6 +533,8 @@ def main():
         eval_interval=args.eval_interval,
         max_steps=args.max_steps,
         resume_from=args.resume_from,
+        prostt5_eval_interval=args.prostt5_eval_interval,
+        prostt5_eval_samples=args.prostt5_eval_samples,
     )
 
 
