@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Training script for sequence-to-structure prediction using Llama 3.1 8B.
+Training script for sequence-to-structure prediction.
+
+Supports multiple model configurations via --mode argument:
+- llama-8b-lora: LoRA fine-tuning on Llama 3.1 8B (default)
+- tinyllama-full: Full fine-tuning on TinyLlama 1.1B
 
 Uses DeepSpeed ZeRO-3 for multi-GPU training on 8x H100 GPUs.
 """
@@ -25,6 +29,33 @@ from transformers import (
 
 from .dataset import AA_START, SEP_TOKEN, SS_START, StructurePredictionDataset
 
+# Model configuration presets
+MODEL_CONFIGS = {
+    "llama-8b-lora": {
+        "model_name": "meta-llama/Llama-3.1-8B",
+        "use_lora": True,
+        "lora_r": 64,
+        "lora_alpha": 128,
+        "lora_target_modules": [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        "default_lr": 2e-4,
+        "default_batch_size": 24,
+        "gradient_checkpointing": True,
+    },
+    "tinyllama-full": {
+        "model_name": "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
+        "use_lora": False,
+        "lora_r": None,
+        "lora_alpha": None,
+        "lora_target_modules": None,
+        "default_lr": 1e-4,
+        "default_batch_size": 32,
+        "gradient_checkpointing": True,
+    },
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -47,6 +78,10 @@ def create_model_and_tokenizer(
     use_lora: bool = True,
     use_4bit: bool = False,
     use_flash_attn: bool = True,
+    lora_r: int = 64,
+    lora_alpha: int = 128,
+    lora_target_modules: list[str] | None = None,
+    gradient_checkpointing: bool = True,
 ):
     """Create model and tokenizer with optional LoRA and quantization."""
 
@@ -88,27 +123,27 @@ def create_model_and_tokenizer(
     model.resize_token_embeddings(len(tokenizer))
 
     # Enable gradient checkpointing to reduce memory
-    model.gradient_checkpointing_enable()
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
 
     # Apply LoRA
     if use_lora:
         if use_4bit:
             model = prepare_model_for_kbit_training(model)
 
+        # Default target modules if not specified
+        if lora_target_modules is None:
+            lora_target_modules = [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ]
+
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
-            r=64,
-            lora_alpha=128,
+            r=lora_r,
+            lora_alpha=lora_alpha,
             lora_dropout=0.05,
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
+            target_modules=lora_target_modules,
             bias="none",
         )
         model = get_peft_model(model, lora_config)
@@ -160,16 +195,16 @@ def create_dataloaders(
 
 
 def train(
-    model_name: str = "meta-llama/Llama-3.1-8B",
+    mode: str = "llama-8b-lora",
+    model_name: str | None = None,
     db_path: str = "data/foldseek/afdb50/afdb50",
     output_dir: str = "outputs/structure_predictor",
-    batch_size: int = 4,
+    batch_size: int | None = None,
     gradient_accumulation_steps: int = 8,
-    learning_rate: float = 2e-4,
+    learning_rate: float | None = None,
     num_epochs: int = 3,
     max_length: int = 1024,
     warmup_ratio: float = 0.03,
-    use_lora: bool = True,
     use_4bit: bool = False,
     use_flash_attn: bool = True,
     log_interval: int = 10,
@@ -182,6 +217,22 @@ def train(
 ):
     """Main training function."""
 
+    # Resolve mode configuration
+    if mode not in MODEL_CONFIGS:
+        raise ValueError(f"Unknown mode: {mode}. Available: {list(MODEL_CONFIGS.keys())}")
+
+    config = MODEL_CONFIGS[mode]
+
+    # Apply config defaults, allow CLI overrides
+    model_name = model_name or config["model_name"]
+    use_lora = config["use_lora"]
+    lora_r = config["lora_r"]
+    lora_alpha = config["lora_alpha"]
+    lora_target_modules = config["lora_target_modules"]
+    learning_rate = learning_rate or config["default_lr"]
+    batch_size = batch_size or config["default_batch_size"]
+    gradient_checkpointing = config["gradient_checkpointing"]
+
     # Initialize accelerator (mixed_precision and gradient_accumulation handled by DeepSpeed config)
     accelerator = Accelerator(
         log_with="wandb" if os.environ.get("WANDB_API_KEY") else None,
@@ -191,18 +242,22 @@ def train(
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Output directory: {output_dir}")
         logger.info(f"Using {accelerator.num_processes} GPUs")
+        logger.info(f"Mode: {mode} (use_lora={use_lora})")
 
     # Initialize Wandb tracking
     if os.environ.get("WANDB_API_KEY"):
         accelerator.init_trackers(
             project_name=os.environ.get("WANDB_PROJECT", "structure-prediction"),
             config={
+                "mode": mode,
                 "model_name": model_name,
                 "batch_size": batch_size,
                 "learning_rate": learning_rate,
                 "num_epochs": num_epochs,
                 "max_length": max_length,
                 "use_lora": use_lora,
+                "lora_r": lora_r,
+                "lora_alpha": lora_alpha,
             },
         )
 
@@ -213,6 +268,10 @@ def train(
         use_lora=use_lora,
         use_4bit=use_4bit,
         use_flash_attn=use_flash_attn,
+        lora_r=lora_r or 64,
+        lora_alpha=lora_alpha or 128,
+        lora_target_modules=lora_target_modules,
+        gradient_checkpointing=gradient_checkpointing,
     )
 
     # Create dataloaders
@@ -494,10 +553,17 @@ def train(
 def main():
     parser = argparse.ArgumentParser(description="Train structure prediction model")
     parser.add_argument(
+        "--mode",
+        type=str,
+        default="llama-8b-lora",
+        choices=list(MODEL_CONFIGS.keys()),
+        help=f"Training mode preset (default: llama-8b-lora). Available: {list(MODEL_CONFIGS.keys())}",
+    )
+    parser.add_argument(
         "--model-name",
         type=str,
-        default="meta-llama/Llama-3.1-8B",
-        help="Base model name",
+        default=None,
+        help="Override model name from mode preset",
     )
     parser.add_argument(
         "--db-path",
@@ -511,18 +577,27 @@ def main():
         default="outputs/structure_predictor",
         help="Output directory",
     )
-    parser.add_argument("--batch-size", type=int, default=4, help="Batch size per GPU")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Batch size per GPU (default: from mode preset)",
+    )
     parser.add_argument(
         "--gradient-accumulation-steps",
         type=int,
         default=8,
         help="Gradient accumulation steps",
     )
-    parser.add_argument("--learning-rate", type=float, default=2e-4, help="Learning rate")
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="Learning rate (default: from mode preset)",
+    )
     parser.add_argument("--num-epochs", type=int, default=3, help="Number of epochs")
     parser.add_argument("--max-length", type=int, default=1024, help="Max sequence length")
     parser.add_argument("--warmup-ratio", type=float, default=0.03, help="Warmup ratio")
-    parser.add_argument("--no-lora", action="store_true", help="Disable LoRA")
     parser.add_argument("--use-4bit", action="store_true", help="Use 4-bit quantization")
     parser.add_argument("--no-flash-attn", action="store_true", help="Disable Flash Attention")
     parser.add_argument("--log-interval", type=int, default=10, help="Logging interval")
@@ -546,6 +621,7 @@ def main():
     args = parser.parse_args()
 
     train(
+        mode=args.mode,
         model_name=args.model_name,
         db_path=args.db_path,
         output_dir=args.output_dir,
@@ -555,7 +631,6 @@ def main():
         num_epochs=args.num_epochs,
         max_length=args.max_length,
         warmup_ratio=args.warmup_ratio,
-        use_lora=not args.no_lora,
         use_4bit=args.use_4bit,
         use_flash_attn=not args.no_flash_attn,
         log_interval=args.log_interval,
