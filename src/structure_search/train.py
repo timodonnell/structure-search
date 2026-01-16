@@ -299,7 +299,7 @@ def train(
                             f"Loss: {avg_loss:.4f} | LR: {lr:.2e}"
                         )
                     accelerator.log(
-                        {"train_loss": avg_loss, "learning_rate": lr, "step": global_step},
+                        {"train_loss": float(avg_loss), "learning_rate": float(lr)},
                         step=global_step,
                     )
                     running_loss = 0.0
@@ -324,7 +324,7 @@ def train(
                     avg_eval_loss = eval_loss / eval_steps
                     if accelerator.is_main_process:
                         logger.info(f"Step {global_step} | Eval Loss: {avg_eval_loss:.4f}")
-                    accelerator.log({"eval_loss": avg_eval_loss}, step=global_step)
+                    accelerator.log({"eval_loss": float(avg_eval_loss)}, step=global_step)
                     model.train()
 
                 # Save checkpoint
