@@ -327,6 +327,7 @@ def train(
         accelerator.load_state(resume_from)
 
     # Initial validation before training starts (step 0)
+    import time
     if accelerator.is_main_process:
         logger.info("Running initial validation before training...")
 
@@ -334,10 +335,11 @@ def train(
     eval_loss = 0.0
     eval_steps = 0
     max_eval_steps = 50
+    eval_start_time = time.time()
 
     with torch.no_grad():
         eval_iter = iter(val_loader)
-        for _ in range(max_eval_steps):
+        for i in range(max_eval_steps):
             try:
                 eval_batch = next(eval_iter)
             except StopIteration:
@@ -352,12 +354,19 @@ def train(
             eval_loss += outputs.loss.detach().float()
             eval_steps += 1
 
+            # Progress logging every 10 steps
+            if accelerator.is_main_process and (i + 1) % 10 == 0:
+                elapsed = time.time() - eval_start_time
+                eta = elapsed / (i + 1) * (max_eval_steps - i - 1)
+                logger.info(f"  Eval progress: {i + 1}/{max_eval_steps} batches ({elapsed:.1f}s elapsed, ~{eta:.1f}s remaining)")
+
     eval_loss_tensor = torch.tensor([eval_loss], device=accelerator.device)
     gathered_losses = accelerator.gather(eval_loss_tensor)
     avg_eval_loss = gathered_losses.mean() / eval_steps
 
+    eval_elapsed = time.time() - eval_start_time
     if accelerator.is_main_process:
-        logger.info(f"Step 0 | Initial Eval Loss: {avg_eval_loss:.4f}")
+        logger.info(f"Step 0 | Initial Eval Loss: {avg_eval_loss:.4f} (completed in {eval_elapsed:.1f}s)")
     accelerator.log({"eval_loss": float(avg_eval_loss)}, step=0)
 
     # Initial ProstT5 baseline evaluation
@@ -367,10 +376,13 @@ def train(
                 from .evaluate import ProstT5Baseline, compute_token_accuracy
                 from .foldseek_db import PairedFoldseekDB
 
-                logger.info("Running initial ProstT5 baseline evaluation...")
+                logger.info(f"Running initial ProstT5 baseline evaluation ({prostt5_eval_samples} samples)...")
 
+                prostt5_start = time.time()
                 if not hasattr(train, "_prostt5"):
+                    logger.info("  Loading ProstT5 model...")
                     train._prostt5 = ProstT5Baseline(device="cuda:0")
+                    logger.info(f"  ProstT5 model loaded in {time.time() - prostt5_start:.1f}s")
 
                 if not hasattr(train, "_eval_db"):
                     train._eval_db = PairedFoldseekDB(db_path)
@@ -382,8 +394,10 @@ def train(
                 )
 
                 prostt5_correct, prostt5_total = 0, 0
+                samples_processed = 0
+                inference_start = time.time()
 
-                for idx in eval_indices:
+                for i, idx in enumerate(eval_indices):
                     aa_seq, gt_3di = train._eval_db.get_pair(idx)
                     if len(aa_seq) > 200 or len(aa_seq) != len(gt_3di):
                         continue
@@ -392,10 +406,19 @@ def train(
                     _, correct, total = compute_token_accuracy(prostt5_pred, gt_3di)
                     prostt5_correct += correct
                     prostt5_total += total
+                    samples_processed += 1
+
+                    # Progress logging every 10 samples
+                    if (i + 1) % 10 == 0:
+                        elapsed = time.time() - inference_start
+                        eta = elapsed / (i + 1) * (len(eval_indices) - i - 1)
+                        current_acc = prostt5_correct / prostt5_total if prostt5_total > 0 else 0
+                        logger.info(f"  ProstT5 progress: {i + 1}/{len(eval_indices)} samples, acc={current_acc:.4f} ({elapsed:.1f}s elapsed, ~{eta:.1f}s remaining)")
 
                 prostt5_acc = prostt5_correct / prostt5_total if prostt5_total > 0 else 0
+                prostt5_elapsed = time.time() - prostt5_start
 
-                logger.info(f"Step 0 | ProstT5 Baseline Accuracy: {prostt5_acc:.4f}")
+                logger.info(f"Step 0 | ProstT5 Baseline Accuracy: {prostt5_acc:.4f} ({samples_processed} samples in {prostt5_elapsed:.1f}s)")
                 accelerator.log({"prostt5_baseline_accuracy": prostt5_acc}, step=0)
             except Exception as e:
                 logger.warning(f"Initial ProstT5 evaluation failed: {e}")
