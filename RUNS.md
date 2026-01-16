@@ -4,10 +4,15 @@ This file documents training runs for the structure prediction model.
 
 ---
 
-## Run 3: Optimized Batch Size (2026-01-16) ✅ CURRENT
+## Run 4: Stable Training with Eval Fix (2026-01-16) ✅ CURRENT
 
-### Wandb Link
-**https://wandb.ai/timodonnell/structure-prediction/runs/m6oumnrn**
+### Status
+Training successfully running with evaluations completing every 500 steps.
+
+| Step | Train Loss | Eval Loss |
+|------|------------|-----------|
+| 500 | 1.4827 | 1.5777 |
+| 1000 | 1.4695 | 1.5221 |
 
 ### Command
 ```bash
@@ -20,15 +25,15 @@ accelerate launch \
     -m structure_search.train \
     --model-name meta-llama/Llama-3.1-8B \
     --db-path data/foldseek/afdb50/afdb50 \
-    --output-dir outputs/structure_predictor_v7 \
-    --batch-size 48 \
+    --output-dir outputs/structure_predictor_v15 \
+    --batch-size 24 \
     --gradient-accumulation-steps 1 \
     --max-length 1024 \
     --learning-rate 2e-4 \
     --num-epochs 1 \
     --log-interval 10 \
-    --save-interval 500 \
-    --eval-interval 250
+    --save-interval 2000 \
+    --eval-interval 500
 ```
 
 ### Configuration
@@ -39,15 +44,28 @@ accelerate launch \
 | Dataset | afdb50 (66.7M proteins) |
 | LoRA rank | 64 |
 | LoRA alpha | 128 |
-| Batch size (per GPU) | 48 |
-| Gradient accumulation | 1 |
-| Effective batch size | 384 (48 × 8 GPUs) |
+| Batch size (per GPU) | 24 |
+| Effective batch size | 192 (24 × 8 GPUs) |
 | Learning rate | 2e-4 |
 | Max sequence length | 1024 tokens |
 | Precision | bfloat16 |
+| Gradient checkpointing | enabled |
+
+### Key Fixes
+1. **Distributed evaluation fix**: Fixed NCCL timeout during evaluation
+   - Use fixed iteration count (50 steps) with iterator reset
+   - Proper gathering of losses across all GPUs with `accelerator.gather()`
+   - Call `accelerator.save_state()` on all processes
+
+2. **Gradient checkpointing**: Reduces memory for larger batch sizes
+
+---
+
+## Run 3: Optimized Batch Size (2026-01-16) - CRASHED
 
 ### Notes
-- Fixed wandb logging with `accelerator.init_trackers()` and `float()` conversion
+- Crashed during evaluation due to NCCL collective timeout
+- Fixed in Run 4
 - Optimized batch size from 4 to 48 per GPU after OOM testing
 - No gradient accumulation needed with larger batch size
 
