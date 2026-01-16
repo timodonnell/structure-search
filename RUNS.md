@@ -4,13 +4,13 @@ This file documents training runs for the structure prediction model.
 
 ---
 
-## Run 5: ProstT5 Comparison + Validity Metrics (2026-01-16) ✅ CURRENT
+## Run 6: Multi-Model Support + ProstT5 Fix (2026-01-16) ✅ CURRENT
 
 ### Wandb Link
-**https://wandb.ai/timodonnell/structure-prediction/runs/yuaqtvnq**
+**(pending - check wandb for latest run)**
 
 ### Status
-Training with ProstT5 baseline comparison and validity metrics enabled.
+Training with fixed ProstT5 comparison (added barrier to prevent NCCL timeout).
 
 ### Command
 ```bash
@@ -21,9 +21,9 @@ accelerate launch \
     --config_file configs/accelerate_config.yaml \
     --num_processes 8 \
     -m structure_search.train \
-    --model-name meta-llama/Llama-3.1-8B \
+    --mode llama-8b-lora \
     --db-path data/foldseek/afdb50/afdb50 \
-    --output-dir outputs/structure_predictor_v16 \
+    --output-dir outputs/structure_predictor_v17 \
     --batch-size 24 \
     --gradient-accumulation-steps 1 \
     --max-length 1024 \
@@ -36,10 +36,18 @@ accelerate launch \
     --prostt5-eval-samples 50
 ```
 
+### New Features
+1. **Multi-model support**: New `--mode` argument with presets:
+   - `llama-8b-lora`: LoRA fine-tuning on Llama 3.1 8B (default)
+   - `tinyllama-full`: Full fine-tuning on TinyLlama 1.1B
+
+2. **Fixed ProstT5 NCCL timeout**: Added `accelerator.wait_for_everyone()` barrier so all GPUs wait while main process runs ProstT5 comparison
+
 ### Configuration
 
 | Parameter | Value |
 |-----------|-------|
+| Mode | `llama-8b-lora` |
 | Base model | `meta-llama/Llama-3.1-8B` |
 | Dataset | afdb50 (66.7M proteins) |
 | LoRA rank | 64 |
@@ -53,13 +61,25 @@ accelerate launch \
 | ProstT5 eval interval | 1000 steps |
 | ProstT5 eval samples | 50 |
 
-### New Features
-1. **ProstT5 baseline comparison**: Compare 3Di prediction accuracy against ProstT5 every 1000 steps
-2. **Validity metrics**: Track syntactic validity of model outputs:
-   - `validity_length_match`: Fraction with correct output length
-   - `validity_valid_chars`: Fraction with only valid 3Di characters (`pdbvslathmigqnwyfkce`)
-   - `validity_fully_valid`: Fraction passing both checks
-   - `validity_mean_length_diff`: Mean absolute length difference
+---
+
+## Run 5: ProstT5 Comparison + Validity Metrics (2026-01-16) - CRASHED
+
+### Wandb Link
+**https://wandb.ai/timodonnell/structure-prediction/runs/yuaqtvnq**
+
+### Status
+Crashed at step 1000 during ProstT5 comparison due to NCCL timeout.
+
+| Step | Train Loss | Eval Loss |
+|------|------------|-----------|
+| 500 | 1.6210 | 1.5777 |
+| 1000 | 1.4777 | 1.5272 |
+
+### Crash Details
+- NCCL collective timeout at step 1000 when ProstT5 comparison started
+- Cause: Only main process ran ProstT5 eval while other processes continued and timed out waiting for collective operations
+- Fixed in Run 6 by adding `accelerator.wait_for_everyone()` barrier
 
 ---
 
