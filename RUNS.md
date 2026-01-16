@@ -4,13 +4,72 @@ This file documents training runs for the structure prediction model.
 
 ---
 
-## Run 4: Stable Training with Eval Fix (2026-01-16) ✅ CURRENT
+## Run 5: ProstT5 Comparison + Validity Metrics (2026-01-16) ✅ CURRENT
+
+### Wandb Link
+**https://wandb.ai/timodonnell/structure-prediction/runs/yuaqtvnq**
+
+### Status
+Training with ProstT5 baseline comparison and validity metrics enabled.
+
+### Command
+```bash
+export WANDB_API_KEY="<your-key>"
+export WANDB_PROJECT="structure-prediction"
+
+accelerate launch \
+    --config_file configs/accelerate_config.yaml \
+    --num_processes 8 \
+    -m structure_search.train \
+    --model-name meta-llama/Llama-3.1-8B \
+    --db-path data/foldseek/afdb50/afdb50 \
+    --output-dir outputs/structure_predictor_v16 \
+    --batch-size 24 \
+    --gradient-accumulation-steps 1 \
+    --max-length 1024 \
+    --learning-rate 2e-4 \
+    --num-epochs 1 \
+    --log-interval 10 \
+    --save-interval 1000 \
+    --eval-interval 500 \
+    --prostt5-eval-interval 1000 \
+    --prostt5-eval-samples 50
+```
+
+### Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Base model | `meta-llama/Llama-3.1-8B` |
+| Dataset | afdb50 (66.7M proteins) |
+| LoRA rank | 64 |
+| LoRA alpha | 128 |
+| Batch size (per GPU) | 24 |
+| Effective batch size | 192 (24 × 8 GPUs) |
+| Learning rate | 2e-4 |
+| Max sequence length | 1024 tokens |
+| Precision | bfloat16 |
+| Gradient checkpointing | enabled |
+| ProstT5 eval interval | 1000 steps |
+| ProstT5 eval samples | 50 |
+
+### New Features
+1. **ProstT5 baseline comparison**: Compare 3Di prediction accuracy against ProstT5 every 1000 steps
+2. **Validity metrics**: Track syntactic validity of model outputs:
+   - `validity_length_match`: Fraction with correct output length
+   - `validity_valid_chars`: Fraction with only valid 3Di characters (`pdbvslathmigqnwyfkce`)
+   - `validity_fully_valid`: Fraction passing both checks
+   - `validity_mean_length_diff`: Mean absolute length difference
+
+---
+
+## Run 4: Stable Training with Eval Fix (2026-01-16) - STOPPED
 
 ### Wandb Link
 **https://wandb.ai/timodonnell/structure-prediction/runs/kr4u1yod**
 
 ### Status
-Training successfully running with evaluations completing every 500 steps.
+Stopped at step ~1420 to restart with ProstT5 eval enabled.
 
 | Step | Train Loss | Eval Loss |
 |------|------------|-----------|
@@ -38,21 +97,6 @@ accelerate launch \
     --save-interval 2000 \
     --eval-interval 500
 ```
-
-### Configuration
-
-| Parameter | Value |
-|-----------|-------|
-| Base model | `meta-llama/Llama-3.1-8B` |
-| Dataset | afdb50 (66.7M proteins) |
-| LoRA rank | 64 |
-| LoRA alpha | 128 |
-| Batch size (per GPU) | 24 |
-| Effective batch size | 192 (24 × 8 GPUs) |
-| Learning rate | 2e-4 |
-| Max sequence length | 1024 tokens |
-| Precision | bfloat16 |
-| Gradient checkpointing | enabled |
 
 ### Key Fixes
 1. **Distributed evaluation fix**: Fixed NCCL timeout during evaluation

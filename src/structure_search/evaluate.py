@@ -10,6 +10,75 @@ import torch
 from transformers import AutoModelForSeq2SeqLM, T5Tokenizer
 
 
+# Valid Foldseek 3Di alphabet (20 characters, lowercase)
+VALID_3DI_CHARS = set("pdbvslathmigqnwyfkce")
+
+
+def compute_validity_metrics(
+    predictions: list[str],
+    targets: list[str],
+) -> dict:
+    """Compute validity metrics for 3Di predictions.
+
+    Args:
+        predictions: List of predicted 3Di strings
+        targets: List of ground truth 3Di strings (for length reference)
+
+    Returns:
+        Dictionary with validity metrics:
+        - length_match_rate: Fraction of predictions with correct length
+        - valid_chars_rate: Fraction of predictions with only valid 3Di chars
+        - fully_valid_rate: Fraction that are both correct length and valid chars
+        - mean_length_diff: Mean absolute difference in length
+        - invalid_char_examples: Examples of predictions with invalid characters
+    """
+    length_matches = 0
+    valid_chars = 0
+    fully_valid = 0
+    length_diffs = []
+    invalid_examples = []
+
+    for pred, target in zip(predictions, targets):
+        target_len = len(target)
+        pred_len = len(pred)
+
+        # Check length
+        length_ok = pred_len == target_len
+        if length_ok:
+            length_matches += 1
+
+        length_diffs.append(abs(pred_len - target_len))
+
+        # Check characters (only for non-empty predictions)
+        if pred:
+            chars_ok = all(c in VALID_3DI_CHARS for c in pred.lower())
+            if chars_ok:
+                valid_chars += 1
+            elif len(invalid_examples) < 5:  # Keep a few examples
+                invalid_chars = [c for c in pred if c.lower() not in VALID_3DI_CHARS]
+                invalid_examples.append({
+                    "pred": pred[:50] + "..." if len(pred) > 50 else pred,
+                    "invalid_chars": list(set(invalid_chars[:10])),
+                })
+
+            if length_ok and chars_ok:
+                fully_valid += 1
+        else:
+            # Empty prediction - not valid
+            if len(invalid_examples) < 5:
+                invalid_examples.append({"pred": "(empty)", "invalid_chars": []})
+
+    n = len(predictions)
+    return {
+        "length_match_rate": length_matches / n if n > 0 else 0.0,
+        "valid_chars_rate": valid_chars / n if n > 0 else 0.0,
+        "fully_valid_rate": fully_valid / n if n > 0 else 0.0,
+        "mean_length_diff": sum(length_diffs) / n if n > 0 else 0.0,
+        "invalid_char_examples": invalid_examples,
+        "num_samples": n,
+    }
+
+
 class ProstT5Baseline:
     """ProstT5 baseline for amino acid to 3Di structure prediction."""
 

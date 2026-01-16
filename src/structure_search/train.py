@@ -350,7 +350,11 @@ def train(
                         and accelerator.is_main_process
                     ):
                         try:
-                            from .evaluate import ProstT5Baseline, compute_token_accuracy
+                            from .evaluate import (
+                                ProstT5Baseline,
+                                compute_token_accuracy,
+                                compute_validity_metrics,
+                            )
                             from .foldseek_db import PairedFoldseekDB
 
                             logger.info("Running ProstT5 comparison...")
@@ -371,6 +375,10 @@ def train(
 
                             our_correct, our_total = 0, 0
                             prostt5_correct, prostt5_total = 0, 0
+
+                            # Collect predictions for validity metrics
+                            our_predictions = []
+                            ground_truths = []
 
                             unwrapped = accelerator.unwrap_model(model)
 
@@ -411,17 +419,39 @@ def train(
                                 our_correct += correct
                                 our_total += total
 
+                                # Collect for validity metrics
+                                our_predictions.append(our_pred)
+                                ground_truths.append(gt_3di)
+
                             our_acc = our_correct / our_total if our_total > 0 else 0
                             prostt5_acc = prostt5_correct / prostt5_total if prostt5_total > 0 else 0
+
+                            # Compute validity metrics
+                            validity = compute_validity_metrics(our_predictions, ground_truths)
 
                             logger.info(
                                 f"Step {global_step} | Our Accuracy: {our_acc:.4f} | "
                                 f"ProstT5 Accuracy: {prostt5_acc:.4f}"
                             )
+                            logger.info(
+                                f"Step {global_step} | Validity: "
+                                f"length_match={validity['length_match_rate']:.2%}, "
+                                f"valid_chars={validity['valid_chars_rate']:.2%}, "
+                                f"fully_valid={validity['fully_valid_rate']:.2%}"
+                            )
+                            if validity['invalid_char_examples']:
+                                logger.info(
+                                    f"Step {global_step} | Invalid char examples: "
+                                    f"{validity['invalid_char_examples'][:2]}"
+                                )
                             accelerator.log(
                                 {
                                     "our_3di_accuracy": our_acc,
                                     "prostt5_3di_accuracy": prostt5_acc,
+                                    "validity_length_match": validity['length_match_rate'],
+                                    "validity_valid_chars": validity['valid_chars_rate'],
+                                    "validity_fully_valid": validity['fully_valid_rate'],
+                                    "validity_mean_length_diff": validity['mean_length_diff'],
                                 },
                                 step=global_step,
                             )
