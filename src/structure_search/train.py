@@ -312,8 +312,18 @@ def train(
                     model.eval()
                     eval_loss = 0.0
                     eval_steps = 0
+                    max_eval_steps = 50  # Fixed number of steps for all GPUs
+
                     with torch.no_grad():
-                        for eval_batch in val_loader:
+                        eval_iter = iter(val_loader)
+                        for _ in range(max_eval_steps):
+                            try:
+                                eval_batch = next(eval_iter)
+                            except StopIteration:
+                                # Reset iterator if we run out of data
+                                eval_iter = iter(val_loader)
+                                eval_batch = next(eval_iter)
+
                             outputs = model(
                                 input_ids=eval_batch["input_ids"],
                                 attention_mask=eval_batch["attention_mask"],
@@ -321,20 +331,22 @@ def train(
                             )
                             eval_loss += outputs.loss.detach().float()
                             eval_steps += 1
-                            if eval_steps >= 50:  # Limit eval steps
-                                break
 
-                    avg_eval_loss = eval_loss / eval_steps
+                    # Gather losses from all GPUs
+                    eval_loss_tensor = torch.tensor([eval_loss], device=accelerator.device)
+                    gathered_losses = accelerator.gather(eval_loss_tensor)
+                    avg_eval_loss = gathered_losses.mean() / eval_steps
+
                     if accelerator.is_main_process:
                         logger.info(f"Step {global_step} | Eval Loss: {avg_eval_loss:.4f}")
                     accelerator.log({"eval_loss": float(avg_eval_loss)}, step=global_step)
                     model.train()
 
-                # Save checkpoint
+                # Save checkpoint (must be called on all processes)
                 if global_step % save_interval == 0:
+                    save_path = Path(output_dir) / f"checkpoint-{global_step}"
+                    accelerator.save_state(save_path)
                     if accelerator.is_main_process:
-                        save_path = Path(output_dir) / f"checkpoint-{global_step}"
-                        accelerator.save_state(save_path)
                         logger.info(f"Saved checkpoint to {save_path}")
 
                 if max_steps > 0 and global_step >= max_steps:
@@ -343,11 +355,11 @@ def train(
         if max_steps > 0 and global_step >= max_steps:
             break
 
-    # Save final model
-    if accelerator.is_main_process:
-        final_path = Path(output_dir) / "final"
-        accelerator.save_state(final_path)
+    # Save final model (save_state must be called on all processes)
+    final_path = Path(output_dir) / "final"
+    accelerator.save_state(final_path)
 
+    if accelerator.is_main_process:
         # Save model and tokenizer
         unwrapped_model = accelerator.unwrap_model(model)
         if use_lora:
