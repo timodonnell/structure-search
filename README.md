@@ -37,10 +37,8 @@ The training data comes from the AlphaFold Database clustered at 50% sequence id
 # Install uv if not already installed
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Create virtual environment and install dependencies
-uv venv
-source .venv/bin/activate
-uv pip install -e .
+# Install dependencies and create virtual environment
+uv sync
 
 # Install flash attention (optional but recommended for H100s)
 uv pip install flash-attn --no-build-isolation
