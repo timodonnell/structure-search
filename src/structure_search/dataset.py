@@ -2,13 +2,15 @@
 Dataset for sequence-to-structure prediction training.
 
 Formats protein data for causal language modeling:
-<|begin_of_text|><AA>SEQUENCE<SEP><3Di>STRUCTURE<|end_of_text|>
+- 3Di format: <AA>SEQUENCE<SEP><3Di>STRUCTURE
+- Kanzi format: <AA>SEQUENCE<SEP><KANZI>TOKEN_IDS
 """
 
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset, IterableDataset
 
@@ -18,7 +20,11 @@ from .foldseek_db import PairedFoldseekDB
 # Special tokens for sequence-to-structure format
 AA_START = "<AA>"
 SS_START = "<3Di>"
+KANZI_START = "<KANZI>"
 SEP_TOKEN = "<SEP>"
+
+# Kanzi token prefix for vocabulary
+KANZI_TOKEN_PREFIX = "<K"  # Tokens are <K0>, <K1>, ..., <K999>
 
 
 class StructurePredictionDataset(Dataset):
@@ -248,3 +254,183 @@ class StreamingStructureDataset(IterableDataset):
                 rng.shuffle(buffer)
                 for item in buffer:
                     yield item
+
+
+class KanziStructureDataset(Dataset):
+    """Dataset for structure prediction using Kanzi tokens.
+
+    Instead of predicting 3Di tokens (20 vocab), this dataset predicts
+    Kanzi tokens (1000 vocab) which can be decoded to 3D coordinates.
+    """
+
+    def __init__(
+        self,
+        db_path: str | Path,
+        tokenizer: Any,
+        kanzi_tokenizer: Any,
+        max_length: int = 1024,
+        split: str = "train",
+        val_fraction: float = 0.001,
+        seed: int = 42,
+        max_protein_length: int = 400,
+    ):
+        """Initialize Kanzi dataset.
+
+        Args:
+            db_path: Path to Foldseek database with C-alpha coordinates.
+            tokenizer: Hugging Face tokenizer (with Kanzi tokens added).
+            kanzi_tokenizer: KanziTokenizer instance for encoding coordinates.
+            max_length: Maximum sequence length for tokenization.
+            split: 'train' or 'val'.
+            val_fraction: Fraction of data for validation.
+            seed: Random seed for train/val split.
+            max_protein_length: Maximum protein length to include.
+        """
+        self.db_path = Path(db_path)
+        self.tokenizer = tokenizer
+        self.kanzi_tokenizer = kanzi_tokenizer
+        self.max_length = max_length
+        self.split = split
+        self.max_protein_length = max_protein_length
+
+        # Load database with C-alpha coordinates
+        self.paired_db = PairedFoldseekDB(db_path, include_ca=True)
+        self.total_size = len(self.paired_db)
+
+        # Create train/val split indices
+        rng = random.Random(seed)
+        all_indices = list(range(self.total_size))
+        rng.shuffle(all_indices)
+
+        val_size = int(self.total_size * val_fraction)
+        if split == "val":
+            self.indices = all_indices[:val_size]
+        else:
+            self.indices = all_indices[val_size:]
+
+        # Open database handles
+        self.paired_db.__enter__()
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __del__(self):
+        try:
+            self.paired_db.__exit__(None, None, None)
+        except Exception:
+            pass
+
+    def format_example(self, aa_seq: str, kanzi_tokens: list[int]) -> str:
+        """Format a sequence with Kanzi tokens for training.
+
+        Args:
+            aa_seq: Amino acid sequence.
+            kanzi_tokens: List of Kanzi token indices (0-999).
+
+        Returns:
+            Formatted string like "<AA> M K T ... <SEP> <KANZI> <K599> <K358> ..."
+        """
+        aa_spaced = " ".join(aa_seq)
+        # Convert Kanzi token indices to special tokens
+        kanzi_str = " ".join(f"{KANZI_TOKEN_PREFIX}{t}>" for t in kanzi_tokens)
+        return f"{AA_START} {aa_spaced} {SEP_TOKEN} {KANZI_START} {kanzi_str}"
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        real_idx = self.indices[idx]
+
+        try:
+            # Get amino acid sequence and C-alpha coordinates
+            aa_seq, _, ca_coords = self.paired_db.get_triplet(real_idx)
+
+            # Skip proteins that are too long or too short
+            if len(aa_seq) > self.max_protein_length or len(aa_seq) < 10:
+                return self.__getitem__((idx + 1) % len(self))
+
+            # Verify C-alpha coordinates match sequence length
+            if len(ca_coords) != len(aa_seq):
+                # Truncate to shorter length
+                min_len = min(len(ca_coords), len(aa_seq))
+                aa_seq = aa_seq[:min_len]
+                ca_coords = ca_coords[:min_len]
+
+            # Skip if too short after truncation
+            if len(aa_seq) < 10:
+                return self.__getitem__((idx + 1) % len(self))
+
+            # Encode C-alpha coordinates to Kanzi tokens
+            kanzi_tokens = self.kanzi_tokenizer.encode(ca_coords)
+
+            # Verify length match
+            if len(kanzi_tokens) != len(aa_seq):
+                # Truncate to shorter length
+                min_len = min(len(kanzi_tokens), len(aa_seq))
+                aa_seq = aa_seq[:min_len]
+                kanzi_tokens = kanzi_tokens[:min_len]
+
+        except Exception:
+            # Skip problematic entries
+            return self.__getitem__((idx + 1) % len(self))
+
+        # Format the text
+        text = self.format_example(aa_seq, kanzi_tokens)
+
+        # Tokenize
+        encoded = self.tokenizer(
+            text,
+            max_length=self.max_length,
+            truncation=True,
+            padding="max_length",
+            return_tensors="pt",
+        )
+
+        input_ids = encoded["input_ids"].squeeze(0)
+        attention_mask = encoded["attention_mask"].squeeze(0)
+
+        # Create labels: mask loss on input sequence (before <SEP>)
+        labels = input_ids.clone()
+
+        sep_token_id = self.tokenizer.convert_tokens_to_ids(SEP_TOKEN)
+        if sep_token_id is not None and sep_token_id != self.tokenizer.unk_token_id:
+            sep_positions = (input_ids == sep_token_id).nonzero(as_tuple=True)[0]
+            if len(sep_positions) > 0:
+                sep_pos = sep_positions[0].item()
+                labels[: sep_pos + 1] = -100
+        else:
+            # Fallback: find <KANZI> token
+            kanzi_start_id = self.tokenizer.convert_tokens_to_ids(KANZI_START)
+            if kanzi_start_id is not None and kanzi_start_id != self.tokenizer.unk_token_id:
+                kanzi_positions = (input_ids == kanzi_start_id).nonzero(as_tuple=True)[0]
+                if len(kanzi_positions) > 0:
+                    kanzi_pos = kanzi_positions[0].item()
+                    labels[:kanzi_pos] = -100
+
+        # Mask padding
+        labels[attention_mask == 0] = -100
+
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+
+def add_kanzi_tokens(tokenizer) -> int:
+    """Add Kanzi tokens to a tokenizer.
+
+    Args:
+        tokenizer: Hugging Face tokenizer to modify.
+
+    Returns:
+        Number of tokens added.
+    """
+    # Add special tokens
+    special_tokens = {
+        "additional_special_tokens": [
+            AA_START,
+            KANZI_START,
+            SEP_TOKEN,
+        ]
+        + [f"{KANZI_TOKEN_PREFIX}{i}>" for i in range(1000)]  # <K0> to <K999>
+    }
+    num_added = tokenizer.add_special_tokens(special_tokens)
+    return num_added

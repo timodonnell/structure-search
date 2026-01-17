@@ -1,0 +1,589 @@
+#!/usr/bin/env python3
+"""
+Training script for Kanzi-based structure prediction.
+
+Predicts Kanzi tokens (1000 vocab) instead of Foldseek 3Di (20 vocab).
+Kanzi tokens can be decoded to 3D C-alpha coordinates for RMSD validation.
+"""
+
+import argparse
+import logging
+import os
+from pathlib import Path
+
+import numpy as np
+import torch
+from accelerate import Accelerator
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    get_cosine_schedule_with_warmup,
+)
+
+from .dataset import (
+    AA_START,
+    KANZI_START,
+    KANZI_TOKEN_PREFIX,
+    SEP_TOKEN,
+    KanziStructureDataset,
+    add_kanzi_tokens,
+)
+from .kanzi_tokenizer import KanziTokenizer
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+def create_model_and_tokenizer(
+    model_name: str,
+    kanzi_checkpoint: str,
+    use_flash_attn: bool = True,
+    gradient_checkpointing: bool = True,
+):
+    """Create model and tokenizer with Kanzi vocabulary."""
+
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # Add Kanzi tokens (1000 structure tokens + special tokens)
+    num_added = add_kanzi_tokens(tokenizer)
+    logger.info(f"Added {num_added} Kanzi tokens to vocabulary")
+
+    # Load model
+    model_kwargs = {
+        "trust_remote_code": True,
+        "torch_dtype": torch.bfloat16,
+    }
+    if use_flash_attn:
+        model_kwargs["attn_implementation"] = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+
+    # Resize embeddings for new tokens
+    model.resize_token_embeddings(len(tokenizer))
+
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+
+    # Load Kanzi tokenizer
+    kanzi_tokenizer = KanziTokenizer(checkpoint_path=kanzi_checkpoint)
+    logger.info(f"Loaded Kanzi tokenizer from {kanzi_checkpoint}")
+
+    return model, tokenizer, kanzi_tokenizer
+
+
+def create_dataloaders(
+    tokenizer,
+    kanzi_tokenizer,
+    db_path: str,
+    batch_size: int = 8,
+    max_length: int = 1024,
+    max_protein_length: int = 400,
+    num_workers: int = 0,  # Use 0 for GPU-based Kanzi encoding
+):
+    """Create train and validation dataloaders."""
+
+    train_dataset = KanziStructureDataset(
+        db_path=db_path,
+        tokenizer=tokenizer,
+        kanzi_tokenizer=kanzi_tokenizer,
+        max_length=max_length,
+        max_protein_length=max_protein_length,
+        split="train",
+    )
+
+    val_dataset = KanziStructureDataset(
+        db_path=db_path,
+        tokenizer=tokenizer,
+        kanzi_tokenizer=kanzi_tokenizer,
+        max_length=max_length,
+        max_protein_length=max_protein_length,
+        split="val",
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader
+
+
+def run_rmsd_eval(
+    model,
+    tokenizer,
+    kanzi_tokenizer,
+    eval_samples: list[tuple[str, np.ndarray]],
+    device,
+    max_new_tokens: int = 512,
+) -> dict:
+    """Run RMSD-based evaluation on generated structures.
+
+    Args:
+        model: The model to evaluate.
+        tokenizer: Tokenizer with Kanzi tokens.
+        kanzi_tokenizer: KanziTokenizer for decoding.
+        eval_samples: List of (aa_seq, gt_ca_coords) tuples.
+        device: Device to run on.
+        max_new_tokens: Maximum tokens to generate.
+
+    Returns:
+        Dictionary with RMSD metrics.
+    """
+    from kanzi import kabsch_rmsd
+
+    model.eval()
+
+    rmsds = []
+    token_accuracies = []
+    valid_predictions = 0
+
+    for aa_seq, gt_coords in eval_samples:
+        # Format input prompt
+        aa_spaced = " ".join(aa_seq)
+        prompt = f"{AA_START} {aa_spaced} {SEP_TOKEN} {KANZI_START}"
+
+        inputs = tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=1024,
+        ).to(device)
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=len(aa_seq) + 10,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                use_cache=True,
+            )
+
+        # Decode and extract Kanzi tokens
+        decoded = tokenizer.decode(outputs[0], skip_special_tokens=False)
+
+        # Parse Kanzi tokens from output
+        if KANZI_START in decoded:
+            kanzi_part = decoded.split(KANZI_START)[1]
+            # Extract <K###> tokens
+            pred_tokens = []
+            for token in kanzi_part.split():
+                if token.startswith(KANZI_TOKEN_PREFIX) and token.endswith(">"):
+                    try:
+                        token_id = int(token[2:-1])  # Extract number from <K###>
+                        if 0 <= token_id < 1000:
+                            pred_tokens.append(token_id)
+                    except ValueError:
+                        continue
+                if len(pred_tokens) >= len(aa_seq):
+                    break
+        else:
+            pred_tokens = []
+
+        if len(pred_tokens) == 0:
+            continue
+
+        valid_predictions += 1
+
+        # Truncate to match lengths
+        min_len = min(len(pred_tokens), len(gt_coords))
+        pred_tokens = pred_tokens[:min_len]
+        gt_coords_trimmed = gt_coords[:min_len]
+
+        # Decode predicted tokens to coordinates
+        try:
+            pred_coords = kanzi_tokenizer.decode(pred_tokens)
+
+            # Compute RMSD
+            rmsd = kabsch_rmsd(
+                pred_coords / 10.0,  # Convert to nm
+                gt_coords_trimmed / 10.0,
+            )
+            rmsds.append(float(rmsd * 10.0))  # Back to Angstroms
+        except Exception:
+            pass
+
+        # Compute ground truth tokens for token accuracy
+        gt_tokens = kanzi_tokenizer.encode(gt_coords_trimmed)
+        if len(gt_tokens) == len(pred_tokens):
+            correct = sum(p == g for p, g in zip(pred_tokens, gt_tokens))
+            token_accuracies.append(correct / len(gt_tokens))
+
+    n = len(eval_samples)
+    return {
+        "rmsd_mean": np.mean(rmsds) if rmsds else float("nan"),
+        "rmsd_median": np.median(rmsds) if rmsds else float("nan"),
+        "rmsd_std": np.std(rmsds) if rmsds else float("nan"),
+        "token_accuracy": np.mean(token_accuracies) if token_accuracies else 0.0,
+        "valid_predictions": valid_predictions / n if n > 0 else 0.0,
+        "num_samples": n,
+    }
+
+
+def get_eval_samples(
+    db_path: str,
+    kanzi_tokenizer,
+    num_samples: int = 50,
+    seed: int = 42,
+    max_seq_len: int = 200,
+):
+    """Get fixed eval samples for RMSD evaluation."""
+    import random
+
+    from .foldseek_db import PairedFoldseekDB
+
+    rng = random.Random(seed)
+
+    samples = []
+    with PairedFoldseekDB(db_path, include_ca=True) as db:
+        # Get validation indices (same split as dataset)
+        total = len(db)
+        all_indices = list(range(total))
+        rng_split = random.Random(42)
+        rng_split.shuffle(all_indices)
+        val_size = int(total * 0.001)
+        val_indices = all_indices[:val_size]
+
+        rng.shuffle(val_indices)
+
+        for idx in val_indices:
+            if len(samples) >= num_samples:
+                break
+            aa_seq, _, ca_coords = db.get_triplet(idx)
+            if len(aa_seq) <= max_seq_len and len(aa_seq) == len(ca_coords):
+                samples.append((aa_seq, ca_coords))
+
+    return samples
+
+
+def train(
+    model_name: str = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
+    kanzi_checkpoint: str = "checkpoints/cleaned_model.pt",
+    db_path: str = "data/foldseek/afdb50/afdb50",
+    output_dir: str = "outputs/kanzi_predictor",
+    batch_size: int = 8,
+    gradient_accumulation_steps: int = 4,
+    learning_rate: float = 1e-4,
+    num_epochs: int = 3,
+    max_length: int = 1024,
+    max_protein_length: int = 400,
+    warmup_ratio: float = 0.03,
+    use_flash_attn: bool = True,
+    log_interval: int = 10,
+    save_interval: int = 1000,
+    eval_interval: int = 500,
+    rmsd_eval_interval: int = 500,
+    rmsd_eval_samples: int = 25,
+    max_steps: int = -1,
+):
+    """Main training function for Kanzi structure prediction."""
+
+    # Initialize accelerator
+    accelerator = Accelerator(
+        log_with="wandb" if os.environ.get("WANDB_API_KEY") else None,
+    )
+
+    if accelerator.is_main_process:
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Output directory: {output_dir}")
+        logger.info(f"Using {accelerator.num_processes} GPUs")
+
+    # Initialize Wandb
+    if os.environ.get("WANDB_API_KEY"):
+        accelerator.init_trackers(
+            project_name=os.environ.get("WANDB_PROJECT", "structure-prediction"),
+            config={
+                "model_name": model_name,
+                "batch_size": batch_size,
+                "learning_rate": learning_rate,
+                "structure_type": "kanzi",
+            },
+        )
+
+    # Create model and tokenizers
+    logger.info(f"Loading model: {model_name}")
+    model, tokenizer, kanzi_tokenizer = create_model_and_tokenizer(
+        model_name=model_name,
+        kanzi_checkpoint=kanzi_checkpoint,
+        use_flash_attn=use_flash_attn,
+    )
+
+    # Create dataloaders
+    logger.info(f"Loading data from: {db_path}")
+    train_loader, val_loader = create_dataloaders(
+        tokenizer=tokenizer,
+        kanzi_tokenizer=kanzi_tokenizer,
+        db_path=db_path,
+        batch_size=batch_size,
+        max_length=max_length,
+        max_protein_length=max_protein_length,
+    )
+
+    # Calculate training steps
+    num_training_steps = len(train_loader) * num_epochs // gradient_accumulation_steps
+    if max_steps > 0:
+        num_training_steps = min(num_training_steps, max_steps)
+    num_warmup_steps = int(num_training_steps * warmup_ratio)
+
+    logger.info(f"Total training steps: {num_training_steps}")
+    logger.info(f"Warmup steps: {num_warmup_steps}")
+
+    # Create optimizer and scheduler
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        betas=(0.9, 0.95),
+        weight_decay=0.01,
+    )
+
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+    )
+
+    # Prepare with accelerator
+    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, scheduler
+    )
+
+    # Get fixed eval samples for RMSD evaluation
+    eval_samples = None
+    if rmsd_eval_interval > 0 and accelerator.is_main_process:
+        logger.info(f"Loading {rmsd_eval_samples} eval samples for RMSD evaluation...")
+        eval_samples = get_eval_samples(
+            db_path=db_path,
+            kanzi_tokenizer=kanzi_tokenizer,
+            num_samples=rmsd_eval_samples,
+            max_seq_len=200,
+        )
+        logger.info(f"Loaded {len(eval_samples)} eval samples")
+
+    # Training loop
+    model.train()
+    global_step = 0
+    running_loss = 0.0
+
+    progress_bar = tqdm(
+        range(num_training_steps),
+        desc="Training",
+        disable=not accelerator.is_main_process,
+    )
+
+    for epoch in range(num_epochs):
+        for step, batch in enumerate(train_loader):
+            with accelerator.accumulate(model):
+                outputs = model(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    labels=batch["labels"],
+                )
+                loss = outputs.loss
+                accelerator.backward(loss)
+
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), 1.0)
+
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+            running_loss += loss.detach().float()
+
+            if accelerator.sync_gradients:
+                global_step += 1
+                progress_bar.update(1)
+
+                # Logging
+                if global_step % log_interval == 0:
+                    avg_loss = running_loss / log_interval
+                    lr = scheduler.get_last_lr()[0]
+                    if accelerator.is_main_process:
+                        logger.info(
+                            f"Step {global_step}/{num_training_steps} | "
+                            f"Loss: {avg_loss:.4f} | LR: {lr:.2e}"
+                        )
+                    accelerator.log(
+                        {"train_loss": float(avg_loss), "learning_rate": float(lr)},
+                        step=global_step,
+                    )
+                    running_loss = 0.0
+
+                # Evaluation
+                if eval_interval > 0 and global_step % eval_interval == 0:
+                    model.eval()
+                    eval_loss = 0.0
+                    eval_steps = 0
+                    max_eval_steps = 50
+
+                    with torch.no_grad():
+                        eval_iter = iter(val_loader)
+                        for _ in range(max_eval_steps):
+                            try:
+                                eval_batch = next(eval_iter)
+                            except StopIteration:
+                                eval_iter = iter(val_loader)
+                                eval_batch = next(eval_iter)
+
+                            outputs = model(
+                                input_ids=eval_batch["input_ids"],
+                                attention_mask=eval_batch["attention_mask"],
+                                labels=eval_batch["labels"],
+                            )
+                            eval_loss += outputs.loss.detach().float()
+                            eval_steps += 1
+
+                    eval_loss_tensor = torch.tensor([eval_loss], device=accelerator.device)
+                    gathered_losses = accelerator.gather(eval_loss_tensor)
+                    avg_eval_loss = gathered_losses.mean() / eval_steps
+
+                    if accelerator.is_main_process:
+                        logger.info(f"Step {global_step} | Eval Loss: {avg_eval_loss:.4f}")
+                    accelerator.log({"eval_loss": float(avg_eval_loss)}, step=global_step)
+                    model.train()
+
+                # RMSD evaluation (independent from standard eval)
+                if (
+                    rmsd_eval_interval > 0
+                    and global_step % rmsd_eval_interval == 0
+                    and eval_samples
+                    and accelerator.is_main_process
+                ):
+                    model.eval()
+                    logger.info(f"Running RMSD evaluation ({len(eval_samples)} samples)...")
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    rmsd_metrics = run_rmsd_eval(
+                        model=unwrapped_model,
+                        tokenizer=tokenizer,
+                        kanzi_tokenizer=kanzi_tokenizer,
+                        eval_samples=eval_samples,
+                        device=accelerator.device,
+                    )
+                    logger.info(
+                        f"Step {global_step} | RMSD: {rmsd_metrics['rmsd_mean']:.2f} Å, "
+                        f"Token Acc: {rmsd_metrics['token_accuracy']:.4f}"
+                    )
+                    accelerator.log(rmsd_metrics, step=global_step)
+                    model.train()
+
+                # Save checkpoint
+                if save_interval > 0 and global_step % save_interval == 0:
+                    save_path = Path(output_dir) / f"checkpoint-{global_step}"
+                    accelerator.save_state(save_path)
+                    if accelerator.is_main_process:
+                        logger.info(f"Saved checkpoint to {save_path}")
+
+                if max_steps > 0 and global_step >= max_steps:
+                    break
+
+        if max_steps > 0 and global_step >= max_steps:
+            break
+
+    # Save final model
+    final_path = Path(output_dir) / "final"
+    accelerator.save_state(final_path)
+
+    if accelerator.is_main_process:
+        unwrapped_model = accelerator.unwrap_model(model)
+        unwrapped_model.save_pretrained(final_path / "model")
+        tokenizer.save_pretrained(final_path / "tokenizer")
+        logger.info(f"Saved final model to {final_path}")
+
+    accelerator.end_training()
+    return model, tokenizer
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train Kanzi structure prediction model")
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T",
+        help="Base model from Hugging Face",
+    )
+    parser.add_argument(
+        "--kanzi-checkpoint",
+        type=str,
+        default="checkpoints/cleaned_model.pt",
+        help="Path to Kanzi model checkpoint",
+    )
+    parser.add_argument(
+        "--db-path",
+        type=str,
+        default="data/foldseek/afdb50/afdb50",
+        help="Path to Foldseek database",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="outputs/kanzi_predictor",
+        help="Output directory",
+    )
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size per GPU")
+    parser.add_argument(
+        "--gradient-accumulation-steps", type=int, default=4, help="Gradient accumulation"
+    )
+    parser.add_argument("--learning-rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--num-epochs", type=int, default=3, help="Number of epochs")
+    parser.add_argument("--max-length", type=int, default=1024, help="Max sequence length")
+    parser.add_argument(
+        "--max-protein-length", type=int, default=400, help="Max protein length"
+    )
+    parser.add_argument("--warmup-ratio", type=float, default=0.03, help="Warmup ratio")
+    parser.add_argument("--no-flash-attn", action="store_true", help="Disable Flash Attention")
+    parser.add_argument("--log-interval", type=int, default=10, help="Logging interval")
+    parser.add_argument("--save-interval", type=int, default=1000, help="Save interval")
+    parser.add_argument("--eval-interval", type=int, default=500, help="Eval interval")
+    parser.add_argument(
+        "--rmsd-eval-interval", type=int, default=500, help="RMSD eval interval"
+    )
+    parser.add_argument(
+        "--rmsd-eval-samples", type=int, default=25, help="Number of RMSD eval samples"
+    )
+    parser.add_argument("--max-steps", type=int, default=-1, help="Max training steps")
+
+    args = parser.parse_args()
+
+    train(
+        model_name=args.model_name,
+        kanzi_checkpoint=args.kanzi_checkpoint,
+        db_path=args.db_path,
+        output_dir=args.output_dir,
+        batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        learning_rate=args.learning_rate,
+        num_epochs=args.num_epochs,
+        max_length=args.max_length,
+        max_protein_length=args.max_protein_length,
+        warmup_ratio=args.warmup_ratio,
+        use_flash_attn=not args.no_flash_attn,
+        log_interval=args.log_interval,
+        save_interval=args.save_interval,
+        eval_interval=args.eval_interval,
+        rmsd_eval_interval=args.rmsd_eval_interval,
+        rmsd_eval_samples=args.rmsd_eval_samples,
+        max_steps=args.max_steps,
+    )
+
+
+if __name__ == "__main__":
+    main()
