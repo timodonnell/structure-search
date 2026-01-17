@@ -4,6 +4,78 @@ This file documents training runs for the structure prediction model.
 
 ---
 
+## Run 9: TinyLlama Full Fine-tune (2026-01-17) ✅ COMPLETED
+
+### Wandb Link
+**https://wandb.ai/timodonnell/structure-search/runs/9c49x0fd**
+
+### Status
+Completed 1000 steps of full fine-tuning on TinyLlama 1.1B.
+
+### Command
+```bash
+WANDB_API_KEY="<key>" WANDB_PROJECT="structure-search" \
+uv run python -m structure_search.train \
+    --mode tinyllama-full \
+    --output-dir outputs/tinyllama-run2 \
+    --max-steps 1000 \
+    --no-flash-attn
+```
+
+### Results
+
+| Metric | Initial (Step 0) | Final (Step 1000) |
+|--------|------------------|-------------------|
+| Eval Loss | 2.1456 | 1.3841 |
+| Gen Token Accuracy | 4.6% | **23.2%** |
+| Length Match Rate | 2% | **18%** |
+| Valid Chars Rate | 12% | **100%** |
+
+### Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Model | TinyLlama-1.1B-intermediate-step-1431k-3T |
+| Mode | Full fine-tuning (no LoRA) |
+| Batch size | 32 |
+| Learning rate | 1e-4 |
+| Max steps | 1000 |
+| GPUs | 1x H100 80GB |
+| Duration | ~34 minutes |
+
+### Notes
+- Model learned to produce 100% valid 3Di characters
+- Token accuracy improved from 4.6% → 23.2%
+- Saved to `outputs/tinyllama-run2/final/`
+
+---
+
+## Run 8: TinyLlama Full Fine-tune (2026-01-17) ✅ COMPLETED
+
+### Wandb Link
+**https://wandb.ai/timodonnell/structure-search/runs/6uwnq1nt**
+
+### Status
+Completed 1000 steps of full fine-tuning on TinyLlama 1.1B.
+
+### Results
+
+| Metric | Initial (Step 0) | Final (Step 1000) |
+|--------|------------------|-------------------|
+| Eval Loss | 2.1457 | 1.3848 |
+| Gen Token Accuracy | 4.6% | **22.2%** |
+| Length Match Rate | 2% | 4% |
+| Valid Chars Rate | 12% | **100%** |
+
+### Configuration
+Same as Run 9. Saved to `outputs/tinyllama-run/final/`.
+
+### Notes
+- First successful TinyLlama training run
+- Duration: ~39 minutes
+
+---
+
 ## Run 7: ProstT5 Baseline Only (2026-01-16) ✅ CURRENT
 
 ### Wandb Link
