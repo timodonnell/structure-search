@@ -229,10 +229,17 @@ def run_rmsd_eval(
             token_accuracies.append(correct / len(gt_tokens))
 
     n = len(eval_samples)
+
+    # Compute fraction of samples below RMSD thresholds
+    rmsd_lt_2 = sum(r < 2.0 for r in rmsds) / len(rmsds) if rmsds else 0.0
+    rmsd_lt_4 = sum(r < 4.0 for r in rmsds) / len(rmsds) if rmsds else 0.0
+
     return {
         "rmsd_mean": np.mean(rmsds) if rmsds else float("nan"),
         "rmsd_median": np.median(rmsds) if rmsds else float("nan"),
         "rmsd_std": np.std(rmsds) if rmsds else float("nan"),
+        "rmsd_lt_2A": rmsd_lt_2,
+        "rmsd_lt_4A": rmsd_lt_4,
         "token_accuracy": np.mean(token_accuracies) if token_accuracies else 0.0,
         "valid_predictions": valid_predictions / n if n > 0 else 0.0,
         "num_samples": n,
