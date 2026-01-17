@@ -9,10 +9,12 @@ Kanzi tokens can be decoded to 3D C-alpha coordinates for RMSD validation.
 import argparse
 import logging
 import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
+import wandb
 from accelerate import Accelerator
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -32,11 +34,46 @@ from .dataset import (
 )
 from .kanzi_tokenizer import KanziTokenizer
 
+# Standard amino acid 3-letter codes
+AA_3LETTER = {
+    'A': 'ALA', 'C': 'CYS', 'D': 'ASP', 'E': 'GLU', 'F': 'PHE',
+    'G': 'GLY', 'H': 'HIS', 'I': 'ILE', 'K': 'LYS', 'L': 'LEU',
+    'M': 'MET', 'N': 'ASN', 'P': 'PRO', 'Q': 'GLN', 'R': 'ARG',
+    'S': 'SER', 'T': 'THR', 'V': 'VAL', 'W': 'TRP', 'Y': 'TYR',
+    'X': 'UNK',
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def coords_to_pdb(coords: np.ndarray, aa_seq: str, chain_id: str = "A") -> str:
+    """Convert C-alpha coordinates to PDB format string.
+
+    Args:
+        coords: C-alpha coordinates in Angstroms, shape (L, 3).
+        aa_seq: Amino acid sequence (1-letter codes).
+        chain_id: Chain identifier.
+
+    Returns:
+        PDB format string.
+    """
+    lines = []
+    for i, (coord, aa) in enumerate(zip(coords, aa_seq)):
+        res_name = AA_3LETTER.get(aa.upper(), 'UNK')
+        res_num = i + 1
+        x, y, z = coord
+        # PDB ATOM record format
+        line = (
+            f"ATOM  {i+1:5d}  CA  {res_name} {chain_id}{res_num:4d}    "
+            f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00           C"
+        )
+        lines.append(line)
+    lines.append("END")
+    return "\n".join(lines)
 
 
 def create_model_and_tokenizer(
@@ -135,7 +172,7 @@ def run_rmsd_eval(
     eval_samples: list[tuple[str, np.ndarray]],
     device,
     max_new_tokens: int = 512,
-) -> dict:
+) -> tuple[dict, list[dict]]:
     """Run RMSD-based evaluation on generated structures.
 
     Args:
@@ -147,13 +184,15 @@ def run_rmsd_eval(
         max_new_tokens: Maximum tokens to generate.
 
     Returns:
-        Dictionary with RMSD metrics.
+        Tuple of (metrics_dict, examples_list).
+        examples_list contains dicts with best, median, worst examples.
     """
     from kanzi import kabsch_rmsd
 
     model.eval()
 
-    rmsds = []
+    # Store individual results for selecting examples
+    results = []
     token_accuracies = []
     valid_predictions = 0
 
@@ -208,6 +247,7 @@ def run_rmsd_eval(
         min_len = min(len(pred_tokens), len(gt_coords))
         pred_tokens = pred_tokens[:min_len]
         gt_coords_trimmed = gt_coords[:min_len]
+        aa_seq_trimmed = aa_seq[:min_len]
 
         # Decode predicted tokens to coordinates
         try:
@@ -218,23 +258,39 @@ def run_rmsd_eval(
                 pred_coords / 10.0,  # Convert to nm
                 gt_coords_trimmed / 10.0,
             )
-            rmsds.append(float(rmsd * 10.0))  # Back to Angstroms
+            rmsd_angstrom = float(rmsd * 10.0)  # Back to Angstroms
+
+            # Compute ground truth tokens for token accuracy
+            gt_tokens = kanzi_tokenizer.encode(gt_coords_trimmed)
+            if len(gt_tokens) == len(pred_tokens):
+                correct = sum(p == g for p, g in zip(pred_tokens, gt_tokens))
+                token_acc = correct / len(gt_tokens)
+                token_accuracies.append(token_acc)
+            else:
+                gt_tokens = []
+                token_acc = 0.0
+
+            # Store result for example selection
+            results.append({
+                "rmsd": rmsd_angstrom,
+                "aa_seq": aa_seq_trimmed,
+                "pred_tokens": pred_tokens,
+                "gt_tokens": gt_tokens,
+                "pred_coords": pred_coords,
+                "gt_coords": gt_coords_trimmed,
+                "token_accuracy": token_acc,
+            })
         except Exception:
             pass
 
-        # Compute ground truth tokens for token accuracy
-        gt_tokens = kanzi_tokenizer.encode(gt_coords_trimmed)
-        if len(gt_tokens) == len(pred_tokens):
-            correct = sum(p == g for p, g in zip(pred_tokens, gt_tokens))
-            token_accuracies.append(correct / len(gt_tokens))
-
     n = len(eval_samples)
+    rmsds = [r["rmsd"] for r in results]
 
     # Compute fraction of samples below RMSD thresholds
     rmsd_lt_2 = sum(r < 2.0 for r in rmsds) / len(rmsds) if rmsds else 0.0
     rmsd_lt_4 = sum(r < 4.0 for r in rmsds) / len(rmsds) if rmsds else 0.0
 
-    return {
+    metrics = {
         "rmsd_mean": np.mean(rmsds) if rmsds else float("nan"),
         "rmsd_median": np.median(rmsds) if rmsds else float("nan"),
         "rmsd_std": np.std(rmsds) if rmsds else float("nan"),
@@ -244,6 +300,20 @@ def run_rmsd_eval(
         "valid_predictions": valid_predictions / n if n > 0 else 0.0,
         "num_samples": n,
     }
+
+    # Select best, median, worst examples
+    examples = []
+    if results:
+        sorted_results = sorted(results, key=lambda x: x["rmsd"])
+        # Best (lowest RMSD)
+        examples.append({"type": "best", **sorted_results[0]})
+        # Worst (highest RMSD)
+        examples.append({"type": "worst", **sorted_results[-1]})
+        # Median
+        median_idx = len(sorted_results) // 2
+        examples.append({"type": "median", **sorted_results[median_idx]})
+
+    return metrics, examples
 
 
 def get_eval_samples(
@@ -478,7 +548,7 @@ def train(
                     model.eval()
                     logger.info(f"Running RMSD evaluation ({len(eval_samples)} samples)...")
                     unwrapped_model = accelerator.unwrap_model(model)
-                    rmsd_metrics = run_rmsd_eval(
+                    rmsd_metrics, examples = run_rmsd_eval(
                         model=unwrapped_model,
                         tokenizer=tokenizer,
                         kanzi_tokenizer=kanzi_tokenizer,
@@ -490,6 +560,76 @@ def train(
                         f"Token Acc: {rmsd_metrics['token_accuracy']:.4f}"
                     )
                     accelerator.log(rmsd_metrics, step=global_step)
+
+                    # Log example structures to wandb
+                    if examples:
+                        try:
+                            # Create wandb table with examples
+                            columns = [
+                                "type", "rmsd", "token_acc", "length",
+                                "pred_tokens", "gt_tokens",
+                                "pred_structure", "gt_structure"
+                            ]
+                            data = []
+
+                            for ex in examples:
+                                # Create PDB strings
+                                pred_pdb = coords_to_pdb(
+                                    ex["pred_coords"], ex["aa_seq"]
+                                )
+                                gt_pdb = coords_to_pdb(
+                                    ex["gt_coords"], ex["aa_seq"]
+                                )
+
+                                # Write to temp files for wandb.Molecule
+                                with tempfile.NamedTemporaryFile(
+                                    mode='w', suffix='.pdb', delete=False
+                                ) as f:
+                                    f.write(pred_pdb)
+                                    pred_pdb_path = f.name
+
+                                with tempfile.NamedTemporaryFile(
+                                    mode='w', suffix='.pdb', delete=False
+                                ) as f:
+                                    f.write(gt_pdb)
+                                    gt_pdb_path = f.name
+
+                                # Format tokens as string (first 20 tokens)
+                                pred_tok_str = " ".join(
+                                    str(t) for t in ex["pred_tokens"][:20]
+                                )
+                                if len(ex["pred_tokens"]) > 20:
+                                    pred_tok_str += "..."
+                                gt_tok_str = " ".join(
+                                    str(t) for t in ex["gt_tokens"][:20]
+                                )
+                                if len(ex["gt_tokens"]) > 20:
+                                    gt_tok_str += "..."
+
+                                data.append([
+                                    ex["type"],
+                                    f"{ex['rmsd']:.2f}",
+                                    f"{ex['token_accuracy']:.3f}",
+                                    len(ex["aa_seq"]),
+                                    pred_tok_str,
+                                    gt_tok_str,
+                                    wandb.Molecule(pred_pdb_path),
+                                    wandb.Molecule(gt_pdb_path),
+                                ])
+
+                                # Clean up temp files
+                                os.unlink(pred_pdb_path)
+                                os.unlink(gt_pdb_path)
+
+                            table = wandb.Table(columns=columns, data=data)
+                            wandb.log(
+                                {f"rmsd_examples_step_{global_step}": table},
+                                step=global_step
+                            )
+                            logger.info(f"Logged {len(examples)} example structures to wandb")
+                        except Exception as e:
+                            logger.warning(f"Failed to log examples to wandb: {e}")
+
                     model.train()
 
                 # Save checkpoint
