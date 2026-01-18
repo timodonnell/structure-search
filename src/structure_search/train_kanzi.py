@@ -563,6 +563,7 @@ def train(
 
                     # Log example structures to wandb
                     if examples:
+                        temp_files = []  # Track temp files to clean up after logging
                         try:
                             # Create wandb table with examples
                             columns = [
@@ -587,12 +588,14 @@ def train(
                                 ) as f:
                                     f.write(pred_pdb)
                                     pred_pdb_path = f.name
+                                    temp_files.append(pred_pdb_path)
 
                                 with tempfile.NamedTemporaryFile(
                                     mode='w', suffix='.pdb', delete=False
                                 ) as f:
                                     f.write(gt_pdb)
                                     gt_pdb_path = f.name
+                                    temp_files.append(gt_pdb_path)
 
                                 # Format tokens as string (first 20 tokens)
                                 pred_tok_str = " ".join(
@@ -617,10 +620,6 @@ def train(
                                     wandb.Molecule(gt_pdb_path),
                                 ])
 
-                                # Clean up temp files
-                                os.unlink(pred_pdb_path)
-                                os.unlink(gt_pdb_path)
-
                             table = wandb.Table(columns=columns, data=data)
                             wandb.log(
                                 {f"rmsd_examples_step_{global_step}": table},
@@ -629,6 +628,13 @@ def train(
                             logger.info(f"Logged {len(examples)} example structures to wandb")
                         except Exception as e:
                             logger.warning(f"Failed to log examples to wandb: {e}")
+                        finally:
+                            # Clean up temp files after wandb has read them
+                            for f in temp_files:
+                                try:
+                                    os.unlink(f)
+                                except OSError:
+                                    pass
 
                     model.train()
 
