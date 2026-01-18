@@ -4,7 +4,13 @@ Train language models from scratch to predict protein structure from amino acid 
 
 ## Overview
 
-This project trains TinyLlama 1.1B from scratch as a sequence-to-structure translation model. Given an amino acid sequence, the model predicts the corresponding structural encoding. Two output formats are supported:
+This project trains language models from scratch as sequence-to-structure translation models. Given an amino acid sequence, the model predicts the corresponding structural encoding.
+
+**Supported architectures:**
+- TinyLlama 1.1B (`TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T`)
+- Llama 3.2 1B (`meta-llama/Llama-3.2-1B`)
+
+**Output formats:**
 
 1. **3Di mode**: Predicts Foldseek's 20-letter structural alphabet
 2. **Kanzi mode**: Predicts 1000 discrete tokens that can be decoded to 3D coordinates
@@ -70,9 +76,14 @@ pip install flash-attn --no-build-isolation
 
 ### Kanzi Mode (Recommended)
 
+Train from scratch with a minimal vocabulary containing only amino acids and Kanzi tokens (~1028 tokens total):
+
+**Using TinyLlama 1.1B architecture:**
 ```bash
 WANDB_API_KEY="your_key" WANDB_PROJECT="tokenfold" \
 uv run python -m tokenfold.train_kanzi \
+    --from-scratch \
+    --model-name TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T \
     --no-flash-attn \
     --batch-size 4 \
     --gradient-accumulation-steps 4 \
@@ -82,6 +93,24 @@ uv run python -m tokenfold.train_kanzi \
     --rmsd-eval-interval 1000 \
     --rmsd-eval-samples 20
 ```
+
+**Using Llama 3.2 1B architecture:**
+```bash
+WANDB_API_KEY="your_key" WANDB_PROJECT="tokenfold" \
+uv run python -m tokenfold.train_kanzi \
+    --from-scratch \
+    --model-name meta-llama/Llama-3.2-1B \
+    --no-flash-attn \
+    --batch-size 4 \
+    --gradient-accumulation-steps 4 \
+    --learning-rate 1e-4 \
+    --log-interval 50 \
+    --eval-interval 500 \
+    --rmsd-eval-interval 1000 \
+    --rmsd-eval-samples 20
+```
+
+> **Note:** Llama 3.2 is a gated model. You need to accept the license on HuggingFace and set `HF_TOKEN` environment variable.
 
 ### 3Di Mode
 
@@ -103,7 +132,8 @@ accelerate launch \
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--model-name` | `TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T` | Base model |
+| `--model-name` | `TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T` | Base model architecture |
+| `--from-scratch` | False | Train from scratch with minimal vocab (~1028 tokens) |
 | `--db-path` | `data/foldseek/afdb50/afdb50` | Path to Foldseek database |
 | `--output-dir` | `outputs/kanzi_predictor` | Output directory |
 | `--batch-size` | 4 | Per-GPU batch size |
@@ -119,7 +149,7 @@ accelerate launch \
 ### Hardware Requirements
 
 - **Recommended**: 1x NVIDIA H100 80GB
-- TinyLlama 1.1B fits comfortably on a single GPU
+- Both TinyLlama 1.1B and Llama 3.2 1B fit comfortably on a single GPU
 - ~46M training examples from AlphaFold DB
 
 ## Project Structure
@@ -157,10 +187,10 @@ The `PairedFoldseekDB` class reads both amino acid and structure databases in pa
 
 ## Model Architecture
 
-- **Base**: TinyLlama 1.1B (trained from scratch on protein data)
-- **Vocabulary**: Extended with structure tokens (20 for 3Di, 1000 for Kanzi)
+- **Base**: TinyLlama 1.1B or Llama 3.2 1B (trained from scratch on protein data)
+- **Vocabulary**: Minimal vocab with amino acids + Kanzi tokens (~1028 tokens)
 - **Precision**: bfloat16
-- **Training**: Full model, no LoRA
+- **Training**: Full model from random initialization, no LoRA
 
 ## Wandb Logging
 
