@@ -466,9 +466,12 @@ def train(
                      and random weight initialization.
     """
 
+    # Check if wandb is available (env var or logged in)
+    wandb_enabled = os.environ.get("WANDB_API_KEY") or wandb.api.api_key
+
     # Initialize accelerator
     accelerator = Accelerator(
-        log_with="wandb" if os.environ.get("WANDB_API_KEY") else None,
+        log_with="wandb" if wandb_enabled else None,
     )
 
     if accelerator.is_main_process:
@@ -476,8 +479,7 @@ def train(
         logger.info(f"Output directory: {output_dir}")
         logger.info(f"Using {accelerator.num_processes} GPUs")
 
-    # Initialize Wandb (check env var or if already logged in)
-    wandb_enabled = os.environ.get("WANDB_API_KEY") or wandb.api.api_key
+    # Initialize Wandb tracking
     if wandb_enabled:
         accelerator.init_trackers(
             project_name=os.environ.get("WANDB_PROJECT", "structure-prediction"),
