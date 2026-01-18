@@ -286,9 +286,9 @@ def run_rmsd_eval(
     n = len(eval_samples)
     rmsds = [r["rmsd"] for r in results]
 
-    # Compute fraction of samples below RMSD thresholds
-    rmsd_lt_2 = sum(r < 2.0 for r in rmsds) / len(rmsds) if rmsds else 0.0
-    rmsd_lt_4 = sum(r < 4.0 for r in rmsds) / len(rmsds) if rmsds else 0.0
+    # Compute fraction of samples below RMSD thresholds (denominator is total samples)
+    rmsd_lt_2 = sum(r < 2.0 for r in rmsds) / n if n > 0 else 0.0
+    rmsd_lt_4 = sum(r < 4.0 for r in rmsds) / n if n > 0 else 0.0
 
     metrics = {
         "rmsd_mean": np.mean(rmsds) if rmsds else float("nan"),
