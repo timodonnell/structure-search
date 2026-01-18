@@ -53,6 +53,7 @@ class StructurePredictionDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.split = split
+        self.eos_token = tokenizer.eos_token or ""
 
         # Load index to get dataset size
         self.paired_db = PairedFoldseekDB(db_path)
@@ -88,7 +89,7 @@ class StructurePredictionDataset(Dataset):
         """
         aa_spaced = " ".join(aa_seq)
         ss_spaced = " ".join(ss_seq)
-        return f"{AA_START} {aa_spaced} {SEP_TOKEN} {SS_START} {ss_spaced}"
+        return f"{AA_START} {aa_spaced} {SEP_TOKEN} {SS_START} {ss_spaced} {self.eos_token}"
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         real_idx = self.indices[idx]
@@ -170,6 +171,7 @@ class StreamingStructureDataset(IterableDataset):
         self.rank = rank
         self.shuffle_buffer_size = shuffle_buffer_size
         self.seed = seed
+        self.eos_token = tokenizer.eos_token or ""
 
     def format_example(self, aa_seq: str, ss_seq: str) -> str:
         """Format a sequence pair for training.
@@ -178,7 +180,7 @@ class StreamingStructureDataset(IterableDataset):
         """
         aa_spaced = " ".join(aa_seq)
         ss_spaced = " ".join(ss_seq)
-        return f"{AA_START} {aa_spaced} {SEP_TOKEN} {SS_START} {ss_spaced}"
+        return f"{AA_START} {aa_spaced} {SEP_TOKEN} {SS_START} {ss_spaced} {self.eos_token}"
 
     def process_example(self, aa_seq: str, ss_seq: str) -> dict[str, torch.Tensor] | None:
         """Process a single example."""
@@ -328,12 +330,13 @@ class KanziStructureDataset(Dataset):
             kanzi_tokens: List of Kanzi token indices (0-999).
 
         Returns:
-            Formatted string like "<AA> M K T ... <SEP> <KANZI> <K599> <K358> ..."
+            Formatted string like "<AA> M K T ... <SEP> <KANZI> <K599> <K358> ... </s>"
         """
         aa_spaced = " ".join(aa_seq)
         # Convert Kanzi token indices to special tokens
         kanzi_str = " ".join(f"{KANZI_TOKEN_PREFIX}{t}>" for t in kanzi_tokens)
-        return f"{AA_START} {aa_spaced} {SEP_TOKEN} {KANZI_START} {kanzi_str}"
+        eos = self.tokenizer.eos_token or ""
+        return f"{AA_START} {aa_spaced} {SEP_TOKEN} {KANZI_START} {kanzi_str} {eos}"
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         real_idx = self.indices[idx]

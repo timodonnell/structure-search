@@ -37,6 +37,9 @@ tokenfold-train-kanzi = "tokenfold.train_kanzi:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
