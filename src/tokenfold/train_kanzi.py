@@ -295,7 +295,8 @@ def run_rmsd_eval(
 
         with torch.no_grad():
             outputs = model.generate(
-                **inputs,
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
                 max_new_tokens=len(aa_seq) + 10,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
@@ -475,8 +476,9 @@ def train(
         logger.info(f"Output directory: {output_dir}")
         logger.info(f"Using {accelerator.num_processes} GPUs")
 
-    # Initialize Wandb
-    if os.environ.get("WANDB_API_KEY"):
+    # Initialize Wandb (check env var or if already logged in)
+    wandb_enabled = os.environ.get("WANDB_API_KEY") or wandb.api.api_key
+    if wandb_enabled:
         accelerator.init_trackers(
             project_name=os.environ.get("WANDB_PROJECT", "structure-prediction"),
             config={
