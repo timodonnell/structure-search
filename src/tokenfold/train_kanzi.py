@@ -468,10 +468,14 @@ def train(
 
     # Check if wandb is available (env var or logged in)
     wandb_enabled = os.environ.get("WANDB_API_KEY") or wandb.api.api_key
+    if not wandb_enabled:
+        raise RuntimeError(
+            "Wandb is required. Either set WANDB_API_KEY or run 'wandb login'"
+        )
 
     # Initialize accelerator
     accelerator = Accelerator(
-        log_with="wandb" if wandb_enabled else None,
+        log_with="wandb",
     )
 
     if accelerator.is_main_process:
