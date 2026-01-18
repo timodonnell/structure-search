@@ -1,4 +1,4 @@
-# Structure Search
+# TokenFold
 
 Train language models from scratch to predict protein structure from amino acid sequence.
 
@@ -71,8 +71,8 @@ pip install flash-attn --no-build-isolation
 ### Kanzi Mode (Recommended)
 
 ```bash
-WANDB_API_KEY="your_key" WANDB_PROJECT="structure-search" \
-uv run python -m structure_search.train_kanzi \
+WANDB_API_KEY="your_key" WANDB_PROJECT="tokenfold" \
+uv run python -m tokenfold.train_kanzi \
     --no-flash-attn \
     --batch-size 4 \
     --gradient-accumulation-steps 4 \
@@ -89,7 +89,7 @@ uv run python -m structure_search.train_kanzi \
 # With accelerate
 accelerate launch \
     --config_file configs/accelerate_config.yaml \
-    -m structure_search.train \
+    -m tokenfold.train \
     --model-name TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T \
     --db-path data/foldseek/afdb50/afdb50 \
     --output-dir outputs/structure_predictor \
@@ -125,7 +125,7 @@ accelerate launch \
 ## Project Structure
 
 ```
-structure-search/
+tokenfold/
 ├── checkpoints/                # Model checkpoints (not in git)
 │   └── cleaned_model.pt        # Kanzi model weights
 ├── configs/
@@ -135,7 +135,7 @@ structure-search/
 │   └── foldseek/               # Symlink to Foldseek databases
 │       └── afdb50/             # AlphaFold DB @ 50% identity
 ├── src/
-│   └── structure_search/
+│   └── tokenfold/
 │       ├── __init__.py
 │       ├── dataset.py          # Dataset classes (3Di and Kanzi)
 │       ├── foldseek_db.py      # Foldseek DB reader (incl. C-alpha)

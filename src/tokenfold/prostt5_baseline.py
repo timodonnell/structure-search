@@ -7,13 +7,13 @@ consistent comparison between our model and ProstT5.
 
 Usage:
     # Create a new wandb run
-    python -m structure_search.prostt5_baseline --db-path data/foldseek/afdb50/afdb50
+    python -m tokenfold.prostt5_baseline --db-path data/foldseek/afdb50/afdb50
 
     # Log to an existing wandb run
-    python -m structure_search.prostt5_baseline --db-path data/foldseek/afdb50/afdb50 --wandb-run-id abc123
+    python -m tokenfold.prostt5_baseline --db-path data/foldseek/afdb50/afdb50 --wandb-run-id abc123
 
     # Use eval samples saved during training
-    python -m structure_search.prostt5_baseline --eval-samples-file outputs/structure_predictor_v22/eval_samples.txt
+    python -m tokenfold.prostt5_baseline --eval-samples-file outputs/structure_predictor_v22/eval_samples.txt
 """
 
 import argparse

@@ -4,25 +4,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-structure-search is an early-stage Python project for protein structure search and analysis. It will utilize AlphaFold protein structure databases via Foldseek.
+TokenFold trains language models (TinyLlama 1.1B) from scratch to predict protein structure from amino acid sequence. Two output modes are supported:
 
-## Current State
+1. **3Di mode**: Predicts Foldseek's 20-letter structural alphabet
+2. **Kanzi mode**: Predicts 1000 discrete tokens that decode to 3D C-alpha coordinates
 
-This repository is in initial setup. No source code, build system, or tests exist yet. The `data/` directory contains a symlink to AlphaFold Swiss-Prot structure databases (Foldseek format).
+## Key Commands
 
-## Recommended Setup
+```bash
+# Install dependencies
+uv sync
 
-When establishing the development infrastructure:
+# Train Kanzi model
+uv run python -m tokenfold.train_kanzi --no-flash-attn
 
-- **Package management**: uv or Poetry
-- **Testing**: pytest
-- **Linting/formatting**: Ruff
-- **Type checking**: mypy
+# Train 3Di model
+uv run python -m tokenfold.train
+```
 
 ## Data Directory
 
-The `data/foldseek/` symlink points to AlphaFold Swiss-Prot protein structure databases in Foldseek format, including:
-- Main structure data (`alphafold_swissprot`)
-- C-alpha atoms (`alphafold_swissprot_ca`)
-- Secondary structure (`alphafold_swissprot_ss`)
-- Associated index and lookup files
+The `data/foldseek/afdb50/` contains AlphaFold Database at 50% sequence identity (~46M structures):
+- `afdb50` - Amino acid sequences
+- `afdb50_ss` - 3Di structure encodings
+- `afdb50_ca` - C-alpha coordinates
+
+## Package Structure
+
+- `src/tokenfold/dataset.py` - Dataset classes for 3Di and Kanzi modes
+- `src/tokenfold/foldseek_db.py` - Foldseek database reader
+- `src/tokenfold/kanzi_tokenizer.py` - Kanzi encode/decode wrapper
+- `src/tokenfold/train.py` - 3Di training script
+- `src/tokenfold/train_kanzi.py` - Kanzi training script with RMSD evaluation

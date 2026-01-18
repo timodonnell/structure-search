@@ -1,7 +1,7 @@
 [project]
-name = "structure-search"
+name = "tokenfold"
 version = "0.1.0"
-description = "Protein structure search and prediction using LLMs"
+description = "Train language models to predict protein structure from sequence"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0.0",
@@ -16,6 +16,7 @@ dependencies = [
     "numpy>=1.24.0",
     "sentencepiece>=0.1.99",
     "protobuf>=3.20.0",
+    "kanzi @ git+https://github.com/rdilip/kanzi.git",
 ]
 
 [project.optional-dependencies]
@@ -29,8 +30,8 @@ flash = [
 ]
 
 [project.scripts]
-train-structure = "structure_search.train:main"
-evaluate-structure = "structure_search.evaluate:main"
+tokenfold-train = "tokenfold.train:main"
+tokenfold-train-kanzi = "tokenfold.train_kanzi:main"
 
 [build-system]
 requires = ["hatchling"]
