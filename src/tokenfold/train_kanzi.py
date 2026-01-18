@@ -34,6 +34,10 @@ from .dataset import (
 )
 from .kanzi_tokenizer import KanziTokenizer
 
+# Standard amino acid alphabet
+AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
+AMINO_ACID_X = "X"  # Unknown/invalid amino acid
+
 # Standard amino acid 3-letter codes
 AA_3LETTER = {
     'A': 'ALA', 'C': 'CYS', 'D': 'ASP', 'E': 'GLU', 'F': 'PHE',
@@ -76,36 +80,117 @@ def coords_to_pdb(coords: np.ndarray, aa_seq: str, chain_id: str = "A") -> str:
     return "\n".join(lines)
 
 
+def create_minimal_tokenizer():
+    """Create a minimal tokenizer with only amino acids and Kanzi tokens.
+
+    Vocabulary:
+    - Special tokens: <PAD>, <EOS>, <BOS>, <UNK>, <AA>, <SEP>, <KANZI>
+    - Amino acids: A, C, D, E, F, G, H, I, K, L, M, N, P, Q, R, S, T, V, W, Y, X
+    - Kanzi tokens: <K0>, <K1>, ..., <K999>
+
+    Total: ~1028 tokens
+    """
+    from tokenizers import Tokenizer, models, pre_tokenizers, processors
+
+    # Build vocabulary
+    vocab = {}
+    idx = 0
+
+    # Special tokens (must be first for compatibility)
+    special_tokens = ["<PAD>", "<EOS>", "<BOS>", "<UNK>", AA_START, SEP_TOKEN, KANZI_START]
+    for token in special_tokens:
+        vocab[token] = idx
+        idx += 1
+
+    # Amino acids (as individual characters, since input is space-separated)
+    for aa in AMINO_ACIDS + AMINO_ACID_X:
+        vocab[aa] = idx
+        idx += 1
+
+    # Kanzi tokens
+    for i in range(1000):
+        vocab[f"{KANZI_TOKEN_PREFIX}{i}>"] = idx
+        idx += 1
+
+    logger.info(f"Created minimal vocabulary with {len(vocab)} tokens")
+
+    # Create tokenizer using WordLevel model (exact token matching)
+    tokenizer_model = models.WordLevel(vocab=vocab, unk_token="<UNK>")
+    tokenizer = Tokenizer(tokenizer_model)
+
+    # Use whitespace pre-tokenizer
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+
+    # Convert to HuggingFace tokenizer
+    from transformers import PreTrainedTokenizerFast
+
+    hf_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        unk_token="<UNK>",
+        pad_token="<PAD>",
+        eos_token="<EOS>",
+        bos_token="<BOS>",
+    )
+
+    return hf_tokenizer
+
+
 def create_model_and_tokenizer(
     model_name: str,
     kanzi_checkpoint: str,
     use_flash_attn: bool = True,
     gradient_checkpointing: bool = True,
+    from_scratch: bool = False,
 ):
-    """Create model and tokenizer with Kanzi vocabulary."""
+    """Create model and tokenizer with Kanzi vocabulary.
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    Args:
+        model_name: HuggingFace model name (used for config if from_scratch=True).
+        kanzi_checkpoint: Path to Kanzi model checkpoint.
+        use_flash_attn: Whether to use Flash Attention 2.
+        gradient_checkpointing: Whether to enable gradient checkpointing.
+        from_scratch: If True, use minimal vocabulary and random initialization.
+    """
+    from transformers import AutoConfig
 
-    # Add Kanzi tokens (1000 structure tokens + special tokens)
-    num_added = add_kanzi_tokens(tokenizer)
-    logger.info(f"Added {num_added} Kanzi tokens to vocabulary")
+    if from_scratch:
+        # Create minimal tokenizer with only amino acids + Kanzi tokens
+        tokenizer = create_minimal_tokenizer()
+        logger.info(f"Created minimal tokenizer with {len(tokenizer)} tokens")
 
-    # Load model
-    model_kwargs = {
-        "trust_remote_code": True,
-        "torch_dtype": torch.bfloat16,
-    }
-    if use_flash_attn:
-        model_kwargs["attn_implementation"] = "flash_attention_2"
+        # Load config from model_name but initialize weights randomly
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        config.vocab_size = len(tokenizer)
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+        if use_flash_attn:
+            config._attn_implementation = "flash_attention_2"
 
-    # Resize embeddings for new tokens
-    model.resize_token_embeddings(len(tokenizer))
+        # Initialize model with random weights
+        model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.bfloat16)
+        logger.info(f"Initialized {model_name} from scratch with vocab size {config.vocab_size}")
+    else:
+        # Load pretrained tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+
+        # Add Kanzi tokens (1000 structure tokens + special tokens)
+        num_added = add_kanzi_tokens(tokenizer)
+        logger.info(f"Added {num_added} Kanzi tokens to vocabulary")
+
+        # Load pretrained model
+        model_kwargs = {
+            "trust_remote_code": True,
+            "torch_dtype": torch.bfloat16,
+        }
+        if use_flash_attn:
+            model_kwargs["attn_implementation"] = "flash_attention_2"
+
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+
+        # Resize embeddings for new tokens
+        model.resize_token_embeddings(len(tokenizer))
 
     if gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -371,8 +456,14 @@ def train(
     rmsd_eval_interval: int = 500,
     rmsd_eval_samples: int = 25,
     max_steps: int = -1,
+    from_scratch: bool = False,
 ):
-    """Main training function for Kanzi structure prediction."""
+    """Main training function for Kanzi structure prediction.
+
+    Args:
+        from_scratch: If True, train with minimal vocabulary (amino acids + Kanzi tokens only)
+                     and random weight initialization.
+    """
 
     # Initialize accelerator
     accelerator = Accelerator(
@@ -393,15 +484,17 @@ def train(
                 "batch_size": batch_size,
                 "learning_rate": learning_rate,
                 "structure_type": "kanzi",
+                "from_scratch": from_scratch,
             },
         )
 
     # Create model and tokenizers
-    logger.info(f"Loading model: {model_name}")
+    logger.info(f"Loading model: {model_name} (from_scratch={from_scratch})")
     model, tokenizer, kanzi_tokenizer = create_model_and_tokenizer(
         model_name=model_name,
         kanzi_checkpoint=kanzi_checkpoint,
         use_flash_attn=use_flash_attn,
+        from_scratch=from_scratch,
     )
 
     # Create dataloaders
@@ -713,6 +806,11 @@ def main():
         "--rmsd-eval-samples", type=int, default=25, help="Number of RMSD eval samples"
     )
     parser.add_argument("--max-steps", type=int, default=-1, help="Max training steps")
+    parser.add_argument(
+        "--from-scratch",
+        action="store_true",
+        help="Train from scratch with minimal vocabulary (amino acids + Kanzi tokens only)",
+    )
 
     args = parser.parse_args()
 
@@ -735,6 +833,7 @@ def main():
         rmsd_eval_interval=args.rmsd_eval_interval,
         rmsd_eval_samples=args.rmsd_eval_samples,
         max_steps=args.max_steps,
+        from_scratch=args.from_scratch,
     )
 
 
